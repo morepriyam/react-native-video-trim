@@ -289,7 +289,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
 
     vc?.pausePlayer()
     
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_\(timestamp).\(outputExt)"
     let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
     outputFile = documentsDirectory.appendingPathComponent(outputName)
@@ -382,22 +382,13 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     let needsReEncode = hasUserTransform || cropNorm != nil || enablePreciseTrimming || needsSpeed
     
     if needsReEncode, let vc = vc {
-      // -noautorotate disables FFmpeg's automatic rotation, so we must manually
-      // compensate for the source video's rotation metadata via transpose filters.
-      if let asset = vc.asset,
-         let videoTrack = asset.tracks(withMediaType: .video).first {
-        let t = videoTrack.preferredTransform
-        let sourceAngle = atan2(t.b, t.a)
-        if abs(sourceAngle - .pi / 2) < 0.1 {
-          videoFilters.append("transpose=1")
-        } else if abs(sourceAngle + .pi / 2) < 0.1 {
-          videoFilters.append("transpose=2")
-        } else if abs(abs(sourceAngle) - .pi) < 0.1 {
-          videoFilters.append("transpose=1")
-          videoFilters.append("transpose=1")
-        }
-      }
-      
+      // Let FFmpeg autorotate the source (note: NO -noautorotate below). Autorotate bakes
+      // the source rotation matrix into upright, display-orientation pixels AND strips the
+      // matrix from the output. The previous approach (-noautorotate + a manual source-
+      // compensation transpose) baked the pixels but left the source rotation matrix on the
+      // output, so on ffmpeg-kit 6 every rotation-tagged portrait clip came out
+      // double-rotated (sideways). User rotate/flip and crop below operate on the already-
+      // upright autorotated frame, so their math is unchanged.
       switch vc.rotationCount {
       case 1: videoFilters.append("transpose=2")
       case 2:
@@ -464,9 +455,9 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         }
       }
       
-      // -noautorotate: we handle rotation via explicit transpose filters above,
-      // so FFmpeg must not auto-rotate or the output will be double-rotated.
-      cmds.append("-noautorotate")
+      // NOTE: intentionally NO -noautorotate. FFmpeg autorotates the input so the source
+      // rotation is baked into the pixels and the output carries no stale rotation matrix
+      // (otherwise rotation-tagged portrait clips are double-rotated -> sideways on ffmpeg-kit 6).
       cmds.append(contentsOf: ["-i", inputFile.path])
       // When enablePreciseTrimming is the only reason for re-encode (no transforms),
       // videoFilters is empty — skip -vf entirely to avoid FFmpeg error on empty filter.
@@ -507,124 +498,164 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
       ])
     }
     
-    print("Command: ", cmds.joined(separator: " "))
-    
-    let eventPayload: [String: Any] = [
-      "message": "Command: \(cmds.joined(separator: " "))"
-    ]
-    self.emitEventToJS("onLog", eventData: eventPayload)
-    
-    ffmpegSession = FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
-      
-      let state = session?.getState()
-      let returnCode = session?.getReturnCode()
-      
-      var shouldCloseEditor = false
-      
-      if ReturnCode.isSuccess(returnCode) {
-        let eventPayload: [String: Any] = ["outputPath": outputFile.absoluteString, "startTime": (startTime * 1000).rounded(), "endTime": (endTime * 1000).rounded(), "duration": (videoDuration * 1000).rounded()]
-        self.emitEventToJS("onFinishTrimming", eventData: eventPayload)
-        
-        if (self.saveToPhoto && isVideoType) {
-          PHPhotoLibrary.requestAuthorization { status in
-            guard status == .authorized else {
-              self.onError(message: "Permission to access Photo Library is not granted", code: .noPhotoPermission)
-              return
-            }
-            
-            PHPhotoLibrary.shared().performChanges({
-              let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputFile)
-              request?.creationDate = Date()
-            }) { success, error in
-              if success {
-                print("Edited video saved to Photo Library successfully.")
-                
-                if self.removeAfterSavedToPhoto {
-                  let _ = VideoTrim.deleteFile(url: outputFile)
-                }
-              } else {
-                self.onError(message: "Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")", code: .failToSaveToPhoto)
-                if self.removeAfterFailedToSavePhoto {
-                  let _ = VideoTrim.deleteFile(url: outputFile)
-                }
-              }
-            }
-          }
-        } else if self.openDocumentsOnFinish {
-          DispatchQueue.main.async {
-            progressAlert.dismiss(animated: true) {
-              self.isTrimming = false
-              self.saveFileToFilesApp(fileURL: outputFile)
-            }
-          }
-          return
-        } else if self.openShareSheetOnFinish {
-          DispatchQueue.main.async {
-            progressAlert.dismiss(animated: true) {
-              self.isTrimming = false
-              self.shareFile(fileURL: outputFile)
-            }
-          }
+    let runLegacy: () -> Void = { [self] in
+      print("Command: ", cmds.joined(separator: " "))
+
+      let eventPayload: [String: Any] = [
+        "message": "Command: \(cmds.joined(separator: " "))"
+      ]
+      emitEventToJS("onLog", eventData: eventPayload)
+
+      ffmpegSession = FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
+
+        let state = session?.getState()
+        let returnCode = session?.getReturnCode()
+
+        if ReturnCode.isSuccess(returnCode) {
+          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, progressAlert: progressAlert)
           return
         }
-        
-        shouldCloseEditor = self.closeWhenFinish
-        
-      } else if ReturnCode.isCancel(returnCode) {
-        // CANCEL
-        self.emitEventToJS("onCancelTrimming", eventData: nil)
-      } else {
-        // FAILURE
-        let classified = VideoTrim.classifyFFmpegError(session: session)
-        self.onError(message: "Command failed with state \(String(describing: FFmpegKitConfig.sessionState(toString: state ?? .failed))) and rc \(String(describing: returnCode)).\(String(describing: session?.getFailStackTrace()))", code: classified)
-        shouldCloseEditor = self.closeWhenFinish
+
+        var shouldCloseEditor = false
+        if ReturnCode.isCancel(returnCode) {
+          // CANCEL
+          self.emitEventToJS("onCancelTrimming", eventData: nil)
+        } else {
+          // FAILURE
+          let classified = VideoTrim.classifyFFmpegError(session: session)
+          self.onError(message: "Command failed with state \(String(describing: FFmpegKitConfig.sessionState(toString: state ?? .failed))) and rc \(String(describing: returnCode)).\(String(describing: session?.getFailStackTrace()))", code: classified)
+          shouldCloseEditor = self.closeWhenFinish
+        }
+
+        DispatchQueue.main.async {
+          progressAlert.dismiss(animated: true) {
+            self.isTrimming = false
+            if shouldCloseEditor {
+              self.closeEditor()
+            }
+          }
+        }
+
+      }, withLogCallback: { log in
+        guard let log = log else { return }
+
+        print("FFmpeg process started with log " + (log.getMessage()));
+
+        let eventPayload: [String: Any] = [
+          "level": log.getLevel(),
+          "message": log.getMessage() ?? "",
+          "sessionId": log.getSessionId(),
+        ]
+        self.emitEventToJS("onLog", eventData: eventPayload)
+
+      }, withStatisticsCallback: { statistics in
+        guard let statistics = statistics else { return }
+
+        let timeInMilliseconds = statistics.getTime()
+        if timeInMilliseconds > 0 {
+          let completePercentage = timeInMilliseconds / (videoDuration * 1000); // from 0 -> 1
+          DispatchQueue.main.async {
+            progressAlert.setProgress(Float(completePercentage))
+          }
+        }
+
+        let eventPayload: [String: Any] = [
+          "sessionId": statistics.getSessionId(),
+          "videoFrameNumber": statistics.getVideoFrameNumber(),
+          "videoFps": statistics.getVideoFps(),
+          "videoQuality": statistics.getVideoQuality(),
+          "size": statistics.getSize(),
+          "time": statistics.getTime(),
+          "bitrate": statistics.getBitrate(),
+          "speed": statistics.getSpeed()
+        ]
+        self.emitEventToJS("onStatistics", eventData: eventPayload)
+      })
+    }
+
+    // Pure cut (no transform/crop/speed) on a video going to mp4/mov → passthrough trim:
+    // frame-accurate via edit lists, zero re-encode, milliseconds regardless of clip length.
+    // Covers both precise and non-precise mode (it is at least as accurate as either legacy
+    // path) and honors mute by dropping the audio track. Failure falls back to FFmpeg.
+    // Note: the progress alert's cancel button only cancels FFmpeg sessions; a passthrough
+    // export finishes in milliseconds, so the cancel window is practically nil.
+    let passthroughFileType: AVFileType? = outputExt == "mp4" ? .mp4 : (outputExt == "mov" ? .mov : nil)
+    let passthroughEligible = isVideoType && !hasUserTransform && cropNorm == nil && !needsSpeed
+      && passthroughFileType != nil
+
+    if passthroughEligible {
+      VideoTrim.passthroughTrim(input: inputFile, startSec: startTime, endSec: endTime, stripAudio: stripAudio, outputFile: outputFile, fileType: passthroughFileType!) { ok in
+        if ok {
+          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, progressAlert: progressAlert)
+        } else {
+          NSLog("[trim] passthrough failed, falling back to FFmpeg")
+          runLegacy()
+        }
       }
-      
+    } else {
+      runLegacy()
+    }
+  }
+
+  // Success flow shared by the passthrough and FFmpeg trim paths: emit onFinishTrimming,
+  // honor saveToPhoto / openDocuments / share, then dismiss the progress alert (closing the
+  // editor when configured).
+  private func handleEditorTrimSuccess(outputFile: URL, startTime: Double, endTime: Double, videoDuration: Double, isVideoType: Bool, progressAlert: ProgressAlertController) {
+    let eventPayload: [String: Any] = ["outputPath": outputFile.absoluteString, "startTime": (startTime * 1000).rounded(), "endTime": (endTime * 1000).rounded(), "duration": (videoDuration * 1000).rounded()]
+    emitEventToJS("onFinishTrimming", eventData: eventPayload)
+
+    if (saveToPhoto && isVideoType) {
+      PHPhotoLibrary.requestAuthorization { status in
+        guard status == .authorized else {
+          self.onError(message: "Permission to access Photo Library is not granted", code: .noPhotoPermission)
+          return
+        }
+
+        PHPhotoLibrary.shared().performChanges({
+          let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputFile)
+          request?.creationDate = Date()
+        }) { success, error in
+          if success {
+            print("Edited video saved to Photo Library successfully.")
+
+            if self.removeAfterSavedToPhoto {
+              let _ = VideoTrim.deleteFile(url: outputFile)
+            }
+          } else {
+            self.onError(message: "Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")", code: .failToSaveToPhoto)
+            if self.removeAfterFailedToSavePhoto {
+              let _ = VideoTrim.deleteFile(url: outputFile)
+            }
+          }
+        }
+      }
+    } else if openDocumentsOnFinish {
       DispatchQueue.main.async {
         progressAlert.dismiss(animated: true) {
           self.isTrimming = false
-          if shouldCloseEditor {
-            self.closeEditor()
-          }
+          self.saveFileToFilesApp(fileURL: outputFile)
         }
       }
-      
-      
-    }, withLogCallback: { log in
-      guard let log = log else { return }
-      
-      print("FFmpeg process started with log " + (log.getMessage()));
-      
-      let eventPayload: [String: Any] = [
-        "level": log.getLevel(),
-        "message": log.getMessage() ?? "",
-        "sessionId": log.getSessionId(),
-      ]
-      self.emitEventToJS("onLog", eventData: eventPayload)
-      
-    }, withStatisticsCallback: { statistics in
-      guard let statistics = statistics else { return }
-      
-      let timeInMilliseconds = statistics.getTime()
-      if timeInMilliseconds > 0 {
-        let completePercentage = timeInMilliseconds / (videoDuration * 1000); // from 0 -> 1
-        DispatchQueue.main.async {
-          progressAlert.setProgress(Float(completePercentage))
+      return
+    } else if openShareSheetOnFinish {
+      DispatchQueue.main.async {
+        progressAlert.dismiss(animated: true) {
+          self.isTrimming = false
+          self.shareFile(fileURL: outputFile)
         }
       }
-      
-      let eventPayload: [String: Any] = [
-        "sessionId": statistics.getSessionId(),
-        "videoFrameNumber": statistics.getVideoFrameNumber(),
-        "videoFps": statistics.getVideoFps(),
-        "videoQuality": statistics.getVideoQuality(),
-        "size": statistics.getSize(),
-        "time": statistics.getTime(),
-        "bitrate": statistics.getBitrate(),
-        "speed": statistics.getSpeed()
-      ]
-      self.emitEventToJS("onStatistics", eventData: eventPayload)
-    })
+      return
+    }
+
+    let shouldCloseEditor = closeWhenFinish
+    DispatchQueue.main.async {
+      progressAlert.dismiss(animated: true) {
+        self.isTrimming = false
+        if shouldCloseEditor {
+          self.closeEditor()
+        }
+      }
+    }
   }
   
   // New Arch
@@ -639,7 +670,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
       return
     }
     
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputExt = config["outputExt"] as? String ?? "mp4"
     let outputName = "\(FILE_PREFIX)_\(timestamp).\(outputExt)"
     let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -723,118 +754,132 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
       ])
     }
     
-    print("Command: ", cmds.joined(separator: " "))
-    
-    FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
-      let returnCode = session?.getReturnCode()
-      
-      if ReturnCode.isSuccess(returnCode) {
-        // Handle saveToPhoto functionality
-        if let saveToPhoto = config["saveToPhoto"] as? Bool, saveToPhoto {
-          print("iOS trim: saveToPhoto is true, attempting to save to photo library")
-          // Check if it's a video type
-          let isVideoType = (config["type"] as? String ?? "video") == "video"
-          
-          if isVideoType {
-            PHPhotoLibrary.requestAuthorization { status in
-              DispatchQueue.main.async {
-                if status == .authorized {
-                  PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputFile)
-                  }) { success, error in
-                    if success {
-                      print("Edited video saved to Photo Library successfully.")
-                      
-                      // Handle removeAfterSavedToPhoto
-                      if let removeAfterSaved = config["removeAfterSavedToPhoto"] as? Bool, removeAfterSaved {
-                        let _ = VideoTrim.deleteFile(url: outputFile)
-                      }
-                      
-                      let result = [
-                        "success": true,
-                        "outputPath": outputFile.absoluteString,
-                        "startTime": startTime,
-                        "endTime": endTime,
-                        "duration": endTime - startTime
-                      ] as [String : Any]
-                      
-                      completion(result)
-                    } else {
-                      print("Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")")
-                      
-                      // Handle removeAfterFailedToSavePhoto
-                      if let removeAfterFailed = config["removeAfterFailedToSavePhoto"] as? Bool, removeAfterFailed {
-                        let _ = VideoTrim.deleteFile(url: outputFile)
-                      }
-                      
-                      let result = [
-                        "success": false,
-                        "message": "Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")",
-                      ] as [String : Any]
-                      
-                      completion(result)
-                    }
+    let runLegacy: () -> Void = {
+      print("Command: ", cmds.joined(separator: " "))
+
+      FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
+        let returnCode = session?.getReturnCode()
+
+        if ReturnCode.isSuccess(returnCode) {
+          VideoTrim.handleHeadlessTrimSuccess(outputFile: outputFile, config: config, startTime: startTime, endTime: endTime, usedPassthrough: false, completion: completion)
+        } else if ReturnCode.isCancel(returnCode) {
+          // CANCEL
+          let result = [
+            "success": false,
+            "message": "FFmpeg command was cancelled with code \(returnCode?.getValue() ?? -1)",
+          ] as [String : Any]
+
+          completion(result)
+        } else {
+          // FAILURE
+          let logs = session?.getAllLogsAsString() ?? ""
+          let result = [
+            "success": false,
+            "message": "Command failed with rc \(String(describing: returnCode)).\(String(describing: session?.getFailStackTrace()))\n\(logs)",
+          ] as [String : Any]
+
+          completion(result)
+        }
+      }, withLogCallback: nil, withStatisticsCallback: nil)
+    }
+
+    // Pure cut (no speed change) on a video going to mp4/mov → passthrough trim: frame-
+    // accurate via edit lists, zero re-encode, milliseconds regardless of clip length.
+    // Headless config times are in MILLISECONDS. Failure falls back to FFmpeg.
+    let isVideo = (config["type"] as? String ?? "video") == "video"
+    let passthroughFileType: AVFileType? = outputExt == "mp4" ? .mp4 : (outputExt == "mov" ? .mov : nil)
+    let passthroughEligible = isVideo && !needsSpeed && passthroughFileType != nil
+
+    if passthroughEligible {
+      VideoTrim.passthroughTrim(input: destPath, startSec: startTime / 1000, endSec: endTime / 1000, stripAudio: stripAudio, outputFile: outputFile, fileType: passthroughFileType!) { ok in
+        if ok {
+          VideoTrim.handleHeadlessTrimSuccess(outputFile: outputFile, config: config, startTime: startTime, endTime: endTime, usedPassthrough: true, completion: completion)
+        } else {
+          NSLog("[trim] passthrough failed, falling back to FFmpeg")
+          runLegacy()
+        }
+      }
+    } else {
+      runLegacy()
+    }
+  }
+
+  // Success flow shared by the passthrough and FFmpeg headless trim paths (saveToPhoto
+  // config handling + result payload). `usedPassthrough` is surfaced so callers can tell
+  // which path produced the output.
+  private static func handleHeadlessTrimSuccess(outputFile: URL, config: NSDictionary, startTime: Double, endTime: Double, usedPassthrough: Bool, completion: @escaping ([String: Any]) -> Void) {
+    let successResult = [
+      "success": true,
+      "outputPath": outputFile.absoluteString,
+      "startTime": startTime,
+      "endTime": endTime,
+      "duration": endTime - startTime,
+      "usedPassthrough": usedPassthrough
+    ] as [String : Any]
+
+    // Handle saveToPhoto functionality
+    if let saveToPhoto = config["saveToPhoto"] as? Bool, saveToPhoto {
+      print("iOS trim: saveToPhoto is true, attempting to save to photo library")
+      // Check if it's a video type
+      let isVideoType = (config["type"] as? String ?? "video") == "video"
+
+      if isVideoType {
+        PHPhotoLibrary.requestAuthorization { status in
+          DispatchQueue.main.async {
+            if status == .authorized {
+              PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputFile)
+              }) { success, error in
+                if success {
+                  print("Edited video saved to Photo Library successfully.")
+
+                  // Handle removeAfterSavedToPhoto
+                  if let removeAfterSaved = config["removeAfterSavedToPhoto"] as? Bool, removeAfterSaved {
+                    let _ = VideoTrim.deleteFile(url: outputFile)
                   }
+
+                  completion(successResult)
                 } else {
-                  // Permission denied
-                  print("Photo Library access denied")
-                  
+                  print("Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")")
+
                   // Handle removeAfterFailedToSavePhoto
                   if let removeAfterFailed = config["removeAfterFailedToSavePhoto"] as? Bool, removeAfterFailed {
                     let _ = VideoTrim.deleteFile(url: outputFile)
                   }
-                  
+
                   let result = [
                     "success": false,
-                    "message": "Photo Library access denied",
+                    "message": "Failed to save edited video to Photo Library: \(error?.localizedDescription ?? "Unknown error")",
                   ] as [String : Any]
-                  
+
                   completion(result)
                 }
               }
+            } else {
+              // Permission denied
+              print("Photo Library access denied")
+
+              // Handle removeAfterFailedToSavePhoto
+              if let removeAfterFailed = config["removeAfterFailedToSavePhoto"] as? Bool, removeAfterFailed {
+                let _ = VideoTrim.deleteFile(url: outputFile)
+              }
+
+              let result = [
+                "success": false,
+                "message": "Photo Library access denied",
+              ] as [String : Any]
+
+              completion(result)
             }
-          } else {
-            // For audio files, we can't save to photo library, just return success
-            let result = [
-              "success": true,
-              "outputPath": outputFile.absoluteString,
-              "startTime": startTime,
-              "endTime": endTime,
-              "duration": endTime - startTime
-            ] as [String : Any]
-            
-            completion(result)
           }
-        } else {
-          let result = [
-            "success": true,
-            "outputPath": outputFile.absoluteString,
-            "startTime": startTime,
-            "endTime": endTime,
-            "duration": endTime - startTime
-          ] as [String : Any]
-          
-          completion(result)
         }
-      } else if ReturnCode.isCancel(returnCode) {
-        // CANCEL
-        let result = [
-          "success": false,
-          "message": "FFmpeg command was cancelled with code \(returnCode?.getValue() ?? -1)",
-        ] as [String : Any]
-        
-        completion(result)
       } else {
-        // FAILURE
-        let logs = session?.getAllLogsAsString() ?? ""
-        let result = [
-          "success": false,
-          "message": "Command failed with rc \(String(describing: returnCode)).\(String(describing: session?.getFailStackTrace()))\n\(logs)",
-        ] as [String : Any]
-        
-        completion(result)
+        // For audio files, we can't save to photo library, just return success
+        completion(successResult)
       }
-    }, withLogCallback: nil, withStatisticsCallback: nil)
+    } else {
+      completion(successResult)
+    }
   }
   
   // Old Arch
@@ -1217,7 +1262,7 @@ extension VideoTrim {
         let cgImage = try generator.copyCGImage(at: cmTime, actualTime: nil)
         let uiImage = UIImage(cgImage: cgImage)
 
-        let timestamp = Int(Date().timeIntervalSince1970)
+        let timestamp = Int(Date().timeIntervalSince1970 * 1000)
         let ext = format == "png" ? "png" : "jpg"
         let outputName = "\(FILE_PREFIX)_frame_\(timestamp).\(ext)"
         let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -1263,7 +1308,7 @@ extension VideoTrim {
     let destPath = URL(string: url) ?? URL(fileURLWithPath: url)
 
     let outputExt = options["outputExt"] as? String ?? "m4a"
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_audio_\(timestamp).\(outputExt)"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
@@ -1314,7 +1359,7 @@ extension VideoTrim {
     let outputExt = options["outputExt"] as? String ?? "mp4"
     let removeAudio = options["removeAudio"] as? Bool ?? false
 
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(outputExt)"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
@@ -1396,7 +1441,7 @@ extension VideoTrim {
     let fps = options["fps"] as? Int ?? 10
     let width = options["width"] as? Int ?? -1
 
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let paletteName = "\(FILE_PREFIX)_palette_\(timestamp).png"
     let outputName = "\(FILE_PREFIX)_gif_\(timestamp).gif"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -1464,10 +1509,180 @@ extension VideoTrim {
   //
   // Limitation: only supports local file paths. Remote URLs are not supported because the
   // default FFmpegKit build does not include OpenSSL (--disable-openssl).
+  // Compact format signature for a clip: "<vcodec>:<w>x<h>r<deg>@<fps>|<acodec>:<sr>:<ch>".
+  // Two clips with equal signatures can be concatenated with stream copy (concat demuxer)
+  // instead of being decoded + re-encoded through the concat filter. Returns nil if the
+  // video track can't be read (treated as "not uniform" so we fall back to the safe path).
+  //
+  // Uses the CODED size plus the rotation tag separately — NOT the display size. Two clips
+  // can share a display size while differing in coded size + rotation (e.g. recorder output
+  // coded 1920x1080+90° vs a normalized clip coded 1080x1920+0°); stream-copying those into
+  // one track yields sideways/corrupt segments, and ffmpeg exits 0 so the fallback never
+  // fires. Coded size + rotation must match exactly for the copy to be valid.
+  // Structured form of the probe above. `sig` is the same copy-compatibility key; the extra
+  // fields let the selective-normalization path (mergeSelective) build a conform command that
+  // re-encodes an outlier clip into the dominant clips' exact coded form.
+  struct ClipInfo {
+    let url: URL
+    let codedW: Int, codedH: Int, rotationDeg: Int
+    let vcodec: String, fps: Int
+    let hasAudio: Bool, audioCodec: String, audioRate: Int, audioCh: Int
+    var sig: String {
+      let a = hasAudio ? "\(audioCodec):\(audioRate):\(audioCh)" : "none"
+      return "\(vcodec):\(codedW)x\(codedH)r\(rotationDeg)@\(fps)|\(a)"
+    }
+  }
+
+  // Degrees for a PURE right-angle rotation transform, or nil for anything else (mirror/
+  // flip/scale/shear). atan2 alone would misclassify e.g. an hflip (a=-1) as "rotation 180",
+  // and conform() would then compensate with the wrong filter — a silently flipped segment
+  // the geometry verify can't catch. Non-rotation transforms make the clip ineligible for
+  // the copy/conform fast paths (legacy re-encode autorotates correctly via FFmpeg instead).
+  private static func pureRotationDegrees(_ t: CGAffineTransform) -> Int? {
+    let vals: [(CGFloat, CGFloat, Int)] = [(1, 0, 0), (0, 1, 90), (-1, 0, 180), (0, -1, 270)]
+    for (a, b, deg) in vals {
+      // Pure rotation: (c, d) = (-b, a); translation components don't affect orientation.
+      if abs(t.a - a) < 0.001, abs(t.b - b) < 0.001, abs(t.c + b) < 0.001, abs(t.d - a) < 0.001 {
+        return deg
+      }
+    }
+    return nil
+  }
+
+  private static func probe(_ url: URL) -> ClipInfo? {
+    let asset = AVURLAsset(url: url)
+    guard let v = asset.tracks(withMediaType: .video).first else { return nil }
+    guard let deg = pureRotationDegrees(v.preferredTransform) else { return nil }
+    var vcodec = "?"
+    if let fd = (v.formatDescriptions as? [CMFormatDescription])?.first {
+      vcodec = fourCC(CMFormatDescriptionGetMediaSubType(fd))
+    }
+    var hasAudio = false, ac = "none", ar = 0, ach = 0
+    if let a = asset.tracks(withMediaType: .audio).first,
+       let fd = (a.formatDescriptions as? [CMFormatDescription])?.first {
+      hasAudio = true
+      ac = fourCC(CMFormatDescriptionGetMediaSubType(fd))
+      if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
+        ar = Int(asbd.mSampleRate.rounded())
+        ach = Int(asbd.mChannelsPerFrame)
+      }
+    }
+    return ClipInfo(
+      url: url,
+      codedW: Int(v.naturalSize.width.rounded()), codedH: Int(v.naturalSize.height.rounded()), rotationDeg: deg,
+      vcodec: vcodec, fps: Int(v.nominalFrameRate.rounded()),
+      hasAudio: hasAudio, audioCodec: ac, audioRate: ar, audioCh: ach)
+  }
+
+  private static func fourCC(_ code: FourCharCode) -> String {
+    let bytes = [UInt8(code >> 24 & 0xff), UInt8(code >> 16 & 0xff), UInt8(code >> 8 & 0xff), UInt8(code & 0xff)]
+    return String(bytes: bytes, encoding: .ascii)?.trimmingCharacters(in: .whitespaces) ?? "?"
+  }
+
+  // MARK: - Passthrough join engine (AVFoundation)
+  //
+  // Joining/cutting compressed bitstreams with ffmpeg's concat demuxer is fragile across
+  // encoders: (1) mp4 tracks get ONE sample description, so segments encoded with different
+  // SPS/PPS decode as garbage while ffmpeg exits 0; (2) the demuxer doesn't rescale packet
+  // timestamps across differing track timescales (camera files use tbn 600, ffmpeg writes
+  // 15360 → a 5s merge reports 136s). Both were reproduced host-side.
+  //
+  // QuickTime/ISO tracks support MULTIPLE sample descriptions, and AVMutableComposition +
+  // AVAssetExportPresetPassthrough writes them natively: compressed samples are copied as-is,
+  // parameter sets and timescales handled per segment, and trims are frame-accurate via edit
+  // lists. Host-validated: a camera-encoded hevc clip joined with a videotoolbox-encoded one
+  // decodes cleanly and keeps exact duration; a mid-GOP trim came out sample-exact (0.600s).
+
+  // One video + (optionally) one audio track, all clips appended in order. Every segment in a
+  // composition track shares ONE preferredTransform — callers must pass the transform that
+  // displays ALL inserted clips upright (for selective merges, outliers are pre-rotated into
+  // the majority's coded orientation so the majority's transform fits them too).
+  private static func buildComposition(_ urls: [URL], transform: CGAffineTransform, includeAudio: Bool) -> AVMutableComposition? {
+    let comp = AVMutableComposition()
+    guard let v = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { return nil }
+    let a = includeAudio ? comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) : nil
+    v.preferredTransform = transform
+    var cursor = CMTime.zero
+    for u in urls {
+      let asset = AVURLAsset(url: u)
+      guard let sv = asset.tracks(withMediaType: .video).first else { return nil }
+      let range = CMTimeRange(start: .zero, duration: asset.duration)
+      do {
+        try v.insertTimeRange(range, of: sv, at: cursor)
+        if let a = a, let sa = asset.tracks(withMediaType: .audio).first {
+          try a.insertTimeRange(range, of: sa, at: cursor)
+        }
+      } catch {
+        return nil
+      }
+      cursor = CMTimeAdd(cursor, asset.duration)
+    }
+    return comp
+  }
+
+  private static func passthroughExport(_ asset: AVAsset, outputFile: URL, fileType: AVFileType, timeRange: CMTimeRange?, completion: @escaping (Bool) -> Void) {
+    try? FileManager.default.removeItem(at: outputFile)
+    guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+      completion(false)
+      return
+    }
+    session.outputURL = outputFile
+    session.outputFileType = fileType
+    if let r = timeRange { session.timeRange = r }
+    session.exportAsynchronously {
+      if session.status != .completed {
+        NSLog("[passthrough] export failed (status \(session.status.rawValue)): \(session.error?.localizedDescription ?? "unknown error")")
+      }
+      completion(session.status == .completed)
+    }
+  }
+
+  // Join clips losslessly and verify the assembled duration against the input sum — assembly
+  // bugs (timescale/edit-list surprises) show up as duration drift, and a cheap probe here
+  // turns "silent corruption" into "fallback to the safe path".
+  private static func joinWithComposition(_ urls: [URL], transform: CGAffineTransform, outputFile: URL, completion: @escaping (Bool) -> Void) {
+    var expected = 0.0
+    for u in urls { expected += CMTimeGetSeconds(AVURLAsset(url: u).duration) }
+    guard let comp = buildComposition(urls, transform: transform, includeAudio: true) else {
+      completion(false)
+      return
+    }
+    passthroughExport(comp, outputFile: outputFile, fileType: .mp4, timeRange: nil) { ok in
+      guard ok else { completion(false); return }
+      let got = CMTimeGetSeconds(AVURLAsset(url: outputFile).duration)
+      let tolerance = max(0.5, expected * 0.01)
+      if abs(got - expected) > tolerance {
+        NSLog("[merge] passthrough join duration drift (got \(got)s, expected \(expected)s); rejecting")
+        completion(false)
+        return
+      }
+      completion(true)
+    }
+  }
+
+  // Frame-accurate trim with NO re-encode: composition over the source + passthrough export
+  // with a timeRange. The cut lands on exact frames via edit lists (players that ignore edit
+  // lists — rare today — would show up to one extra GOP at the head). `stripAudio` simply
+  // omits the audio track. Completes in milliseconds regardless of clip length.
+  public static func passthroughTrim(input: URL, startSec: Double, endSec: Double, stripAudio: Bool, outputFile: URL, fileType: AVFileType, completion: @escaping (Bool) -> Void) {
+    let asset = AVURLAsset(url: input)
+    guard endSec > startSec,
+          let sv = asset.tracks(withMediaType: .video).first,
+          let comp = buildComposition([input], transform: sv.preferredTransform, includeAudio: !stripAudio) else {
+      completion(false)
+      return
+    }
+    let range = CMTimeRange(
+      start: CMTime(seconds: startSec, preferredTimescale: 60000),
+      end: CMTime(seconds: endSec, preferredTimescale: 60000)
+    )
+    passthroughExport(comp, outputFile: outputFile, fileType: fileType, timeRange: range, completion: completion)
+  }
+
   @objc
   public static func merge(_ urls: [String], options: NSDictionary, completion: @escaping ([String: Any]) -> Void) {
     let outputExt = options["outputExt"] as? String ?? "mp4"
-    let timestamp = Int(Date().timeIntervalSince1970)
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_merged_\(timestamp).\(outputExt)"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
@@ -1477,6 +1692,193 @@ extension VideoTrim {
       return
     }
 
+    let inputURLs = urls.map { URL(string: $0) ?? URL(fileURLWithPath: $0) }
+
+    // Probe every input once and branch on how uniform they are. The passthrough engine
+    // writes mp4 — any other requested container goes through the legacy path.
+    let infos = inputURLs.map { probe($0) }
+    let allProbed = infos.allSatisfy { $0 != nil }
+    let sigs = infos.map { $0?.sig }
+    let uniform = allProbed && sigs.allSatisfy { $0 == sigs[0] }
+    let fastEligible = allProbed && outputExt == "mp4"
+
+    let respond: (_ usedFastPath: Bool, _ selective: Bool) -> Void = { usedFastPath, selective in
+      let asset = AVURLAsset(url: outputFile)
+      let duration = CMTimeGetSeconds(asset.duration) * 1000
+      completion([
+        "outputPath": outputFile.absoluteString,
+        "duration": duration.rounded(),
+        "usedFastPath": usedFastPath,
+        "selective": selective,
+      ])
+    }
+
+    // (1) Fast path: every input shares one format signature → passthrough join. No decode,
+    // no encode, I/O-bound. The common case for our own recorder clips, and it scales to any
+    // clip count / total length for free.
+    if fastEligible && uniform {
+      let transform = AVURLAsset(url: inputURLs[0]).tracks(withMediaType: .video).first?.preferredTransform ?? .identity
+      joinWithComposition(inputURLs, transform: transform, outputFile: outputFile) { ok in
+        if ok {
+          respond(true, false)
+        } else {
+          NSLog("[merge] passthrough join failed; falling back to concat-filter re-encode")
+          mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+        }
+      }
+      return
+    }
+
+    // (2) Selective path: inputs are mixed — conform ONLY the outlier clips to the dominant
+    // format, then passthrough-join the set. A draft of recorder clips plus one imported
+    // library clip re-encodes just that one clip, not all of them. Any conform/verify/join
+    // failure falls back to the full re-encode, so the worst case is exactly the old behavior.
+    if fastEligible {
+      let clips = infos.compactMap { $0 }
+      mergeSelective(clips, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp) { ok in
+        if ok {
+          respond(false, true)
+        } else {
+          mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+        }
+      }
+      return
+    }
+
+    // (3) Fallback: a clip couldn't be probed / non-mp4 output.
+    mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+  }
+
+  // Normalized codec family for comparing a conform result against its target ("avc1"/"avc3"
+  // → h264, "hvc1"/"hev1" → hevc).
+  private static func codecFamily(_ fourcc: String) -> String {
+    let lc = fourcc.lowercased()
+    if lc.hasPrefix("avc") { return "h264" }
+    if lc.hasPrefix("hvc") || lc.hasPrefix("hev") { return "hevc" }
+    return lc
+  }
+
+  // Selective normalization: re-encode only the clips that don't match the dominant format,
+  // then passthrough-join the whole set. The conform bakes the outlier into the majority's
+  // CODED orientation (pre-rotated pixels, no rotation tag) so every segment displays
+  // correctly through the majority's shared track transform — which also makes
+  // cross-orientation imports conformable. Every conformed clip is re-probed and must match
+  // the expected coded geometry exactly; any miss aborts to `completion(false)` so the caller
+  // does the full re-encode instead.
+  private static func mergeSelective(_ clips: [ClipInfo], outputFile: URL, cacheDirectory: URL, timestamp: Int, completion: @escaping (Bool) -> Void) {
+    // Dominant signature = most frequent; ties resolved by first occurrence (keeps the majority
+    // — typically the recorder clips — as lossless copies).
+    var counts: [String: Int] = [:]
+    for c in clips { counts[c.sig, default: 0] += 1 }
+    let maxCount = counts.values.max() ?? 0
+    guard let target = clips.first(where: { counts[$0.sig] == maxCount }),
+          target.codedW > 0, target.codedH > 0,
+          let targetTrack = AVURLAsset(url: target.url).tracks(withMediaType: .video).first else {
+      completion(false)
+      return
+    }
+    let targetTransform = targetTrack.preferredTransform
+
+    // Match the best source bitrate (same policy as the filter path) so quality is preserved.
+    var maxBitrate = 0
+    for c in clips {
+      if let tr = AVURLAsset(url: c.url).tracks(withMediaType: .video).first {
+        maxBitrate = max(maxBitrate, Int(tr.estimatedDataRate))
+      }
+    }
+    let bitrateStr = maxBitrate > 0 ? "\(maxBitrate)" : "10M"
+
+    var finalURLs = [URL?](repeating: nil, count: clips.count)
+    var tempFiles: [URL] = []
+
+    func finish(_ ok: Bool) {
+      if ok, finalURLs.allSatisfy({ $0 != nil }) {
+        joinWithComposition(finalURLs.compactMap { $0 }, transform: targetTransform, outputFile: outputFile) { joined in
+          for t in tempFiles { try? FileManager.default.removeItem(at: t) }
+          completion(joined)
+        }
+      } else {
+        for t in tempFiles { try? FileManager.default.removeItem(at: t) }
+        completion(false)
+      }
+    }
+
+    func step(_ i: Int) {
+      if i >= clips.count { finish(true); return }
+      let c = clips[i]
+      if c.sig == target.sig {
+        finalURLs[i] = c.url
+        step(i + 1)
+        return
+      }
+      let temp = cacheDirectory.appendingPathComponent("\(FILE_PREFIX)_conform_\(timestamp)_\(i).mp4")
+      tempFiles.append(temp)
+      conform(c, to: target, bitrate: bitrateStr, output: temp) { ok in
+        // The conform must land in the target's coded geometry with no rotation tag of its
+        // own (the composition supplies the transform). Re-probe and verify; any miss aborts
+        // selective so a wrong-orientation segment can't slip through.
+        if ok, let got = probe(temp),
+           got.codedW == target.codedW, got.codedH == target.codedH,
+           got.rotationDeg == 0,
+           codecFamily(got.vcodec) == codecFamily(target.vcodec) {
+          finalURLs[i] = temp
+          step(i + 1)
+        } else {
+          NSLog("[merge] selective conform failed/verify-mismatch for clip \(i); falling back")
+          finish(false)
+        }
+      }
+    }
+    step(0)
+  }
+
+  // Re-encode one outlier clip to display correctly through the target's track transform:
+  // autorotated (upright) frames are scaled + letterboxed to the target's DISPLAY size, then
+  // pre-rotated into the target's CODED orientation. fps/SAR/pixel-format + audio params are
+  // conformed to keep the output track predictable. The transpose mapping is anchored
+  // empirically (host-validated): preferredTransform angle +90° (ffprobe rotation -90)
+  // requires transpose=2 to map an upright frame into coded orientation.
+  private static func conform(_ clip: ClipInfo, to target: ClipInfo, bitrate: String, output: URL, completion: @escaping (Bool) -> Void) {
+    let swap = target.rotationDeg == 90 || target.rotationDeg == 270
+    let dispW = (swap ? target.codedH : target.codedW) & ~1
+    let dispH = (swap ? target.codedW : target.codedH) & ~1
+    let isHevc = codecFamily(target.vcodec) == "hevc"
+
+    var filters = [
+      "scale=\(dispW):\(dispH):force_original_aspect_ratio=decrease",
+      "pad=\(dispW):\(dispH):(ow-iw)/2:(oh-ih)/2",
+      "setsar=1",
+      "fps=\(target.fps)",
+      "format=yuv420p",
+    ]
+    switch target.rotationDeg {
+    case 90: filters.append("transpose=2")
+    case 270: filters.append("transpose=1")
+    case 180: filters.append("hflip"); filters.append("vflip")
+    default: break
+    }
+
+    var cmds = ["-i", clip.url.path,
+                "-map", "0:v:0",
+                "-vf", filters.joined(separator: ","),
+                "-c:v", isHevc ? "hevc_videotoolbox" : "h264_videotoolbox",
+                "-b:v", bitrate]
+    if isHevc { cmds.append(contentsOf: ["-tag:v", "hvc1"]) }
+    if target.hasAudio && clip.hasAudio {
+      cmds.append(contentsOf: ["-map", "0:a:0", "-c:a", "aac", "-ar", "\(target.audioRate)", "-ac", "\(target.audioCh)"])
+    } else {
+      cmds.append("-an")
+    }
+    cmds.append(contentsOf: ["-movflags", "+faststart", "-y", output.path])
+    FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
+      completion(ReturnCode.isSuccess(session?.getReturnCode()))
+    }, withLogCallback: nil, withStatisticsCallback: nil)
+  }
+
+  // Re-encode concatenation via the concat *filter*. Normalizes every input to the first
+  // clip's resolution/fps/SAR/pixel-format, so mismatched clips merge correctly (letterboxed).
+  private static func mergeWithFilter(_ inputURLs: [URL], outputFile: URL, completion: @escaping ([String: Any]) -> Void) {
+    let urls = inputURLs.map { $0.absoluteString }
     var cmds: [String] = []
     var maxBitrate: Int = 0
     for urlStr in urls {
@@ -1530,7 +1932,8 @@ extension VideoTrim {
         let duration = CMTimeGetSeconds(asset.duration) * 1000
         completion([
           "outputPath": outputFile.absoluteString,
-          "duration": duration.rounded()
+          "duration": duration.rounded(),
+          "usedFastPath": false
         ])
       } else {
         let logs = session?.getAllLogsAsString() ?? ""

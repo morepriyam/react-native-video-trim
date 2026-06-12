@@ -204,6 +204,11 @@ export interface TrimResult {
   outputPath: string;
   /** Whether the trim operation completed successfully. */
   success: boolean;
+  /**
+   * iOS only. `true` when the trim used the AVFoundation passthrough path (frame-accurate,
+   * no re-encode), `false` when it ran through FFmpeg. Undefined on older native builds.
+   */
+  usedPassthrough?: boolean;
 }
 
 /**
@@ -317,6 +322,16 @@ export interface MergeResult {
   outputPath: string;
   /** Total duration of the merged file in milliseconds. */
   duration: number;
+  /**
+   * `true` when the merge used the stream-copy concat-demuxer fast path (no re-encode),
+   * `false` when it fell back to the concat-filter re-encode. Undefined on older native builds.
+   */
+  usedFastPath?: boolean;
+  /**
+   * `true` when the merge used selective normalization — re-encoding only the outlier clips and
+   * stream-copying the rest. Mutually exclusive with `usedFastPath`.
+   */
+  selective?: boolean;
 }
 
 /**
