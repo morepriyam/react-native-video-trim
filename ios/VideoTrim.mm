@@ -75,7 +75,7 @@ RCT_EXPORT_MODULE()
   dict[@"enablePreciseTrimming"] = @(options.enablePreciseTrimming());
   dict[@"removeAudio"] = @(options.removeAudio());
   dict[@"speed"] = @(options.speed());
-  
+
   [self->videoTrim trimWithInputFile:url config:dict completion:^(NSDictionary<NSString *,id> * _Nonnull result) {
     BOOL success = [result[@"success"] boolValue];
     if (success) {
