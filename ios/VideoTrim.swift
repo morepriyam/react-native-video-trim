@@ -1779,14 +1779,18 @@ extension VideoTrim {
     }
     let targetTransform = targetTrack.preferredTransform
 
-    // Match the best source bitrate (same policy as the filter path) so quality is preserved.
+    // Match the best source bitrate, but right-size it to the TARGET resolution: every conform
+    // encodes into the target's coded geometry, so a 1080p target shouldn't inherit a 4K source's
+    // data rate. Anchor ~12 Mbps at 1080p and scale by pixel count; never exceed the best source.
     var maxBitrate = 0
     for c in clips {
       if let tr = AVURLAsset(url: c.url).tracks(withMediaType: .video).first {
         maxBitrate = max(maxBitrate, Int(tr.estimatedDataRate))
       }
     }
-    let bitrateStr = maxBitrate > 0 ? "\(maxBitrate)" : "10M"
+    let resCeiling = Int(12_000_000.0 * Double(target.codedW * target.codedH) / (1920.0 * 1080.0))
+    let conformBitrate = maxBitrate > 0 ? min(maxBitrate, resCeiling) : resCeiling
+    let bitrateStr = "\(max(conformBitrate, 2_000_000))"
 
     var finalURLs = [URL?](repeating: nil, count: clips.count)
     var tempFiles: [URL] = []
@@ -1803,33 +1807,68 @@ extension VideoTrim {
       }
     }
 
-    func step(_ i: Int) {
-      if i >= clips.count { finish(true); return }
-      let c = clips[i]
+    // Pre-pass (single-threaded): pass through clips already in the target format and collect the
+    // outliers that need a conform. Writing finalURLs/tempFiles here is safe because no conform
+    // thread has started yet.
+    var outliers: [(index: Int, temp: URL, audioOnly: Bool)] = []
+    for (i, c) in clips.enumerated() {
       if c.sig == target.sig {
         finalURLs[i] = c.url
-        step(i + 1)
-        return
+        continue
       }
+      // Audio-only fast path: the video already matches the target (codec family / coded size /
+      // rotation / fps) and only the audio token differs, so the conform copies the video stream
+      // untouched and just transcodes the audio — no full video re-encode.
+      let audioOnly = codecFamily(c.vcodec) == codecFamily(target.vcodec)
+        && c.codedW == target.codedW && c.codedH == target.codedH
+        && c.rotationDeg == target.rotationDeg && c.fps == target.fps
       let temp = cacheDirectory.appendingPathComponent("\(FILE_PREFIX)_conform_\(timestamp)_\(i).mp4")
       tempFiles.append(temp)
-      conform(c, to: target, bitrate: bitrateStr, output: temp) { ok in
-        // The conform must land in the target's coded geometry with no rotation tag of its
-        // own (the composition supplies the transform). Re-probe and verify; any miss aborts
-        // selective so a wrong-orientation segment can't slip through.
-        if ok, let got = probe(temp),
-           got.codedW == target.codedW, got.codedH == target.codedH,
-           got.rotationDeg == 0,
-           codecFamily(got.vcodec) == codecFamily(target.vcodec) {
-          finalURLs[i] = temp
-          step(i + 1)
-        } else {
-          NSLog("[merge] selective conform failed/verify-mismatch for clip \(i); falling back")
-          finish(false)
+      outliers.append((i, temp, audioOnly))
+    }
+    if outliers.isEmpty { finish(true); return }
+
+    // Conforms are independent, so run them concurrently — capped so we don't thrash the
+    // videotoolbox encode sessions. All shared-state mutation is serialized on syncQ because
+    // FFmpegKit completions fire on concurrent background threads.
+    let syncQ = DispatchQueue(label: "video-trim.conform.sync")
+    let group = DispatchGroup()
+    let maxInFlight = 2
+    let sem = DispatchSemaphore(value: maxInFlight)
+    var anyFailed = false
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      for (i, temp, audioOnly) in outliers {
+        var abort = false
+        syncQ.sync { abort = anyFailed }
+        if abort { break }
+        sem.wait()
+        group.enter()
+        conform(clips[i], to: target, bitrate: bitrateStr, audioOnly: audioOnly, output: temp) { ok in
+          // Re-probe and verify the conform landed in the target's coded geometry & codec; any miss
+          // aborts selective so a wrong-orientation segment can't slip through. A full conform bakes
+          // rotation into the pixels (rotationDeg 0); the audio-only path copies the video and keeps
+          // the target's rotation tag — so verify rotation against the mode.
+          let wantRot = audioOnly ? target.rotationDeg : 0
+          if ok, let got = probe(temp),
+             got.codedW == target.codedW, got.codedH == target.codedH,
+             got.rotationDeg == wantRot,
+             codecFamily(got.vcodec) == codecFamily(target.vcodec) {
+            syncQ.sync { finalURLs[i] = temp }
+          } else {
+            NSLog("[merge] selective conform failed/verify-mismatch for clip \(i); falling back")
+            syncQ.sync { anyFailed = true }
+          }
+          sem.signal()
+          group.leave()
         }
       }
+      group.notify(queue: .global()) {
+        var failed = false
+        syncQ.sync { failed = anyFailed }
+        finish(!failed)
+      }
     }
-    step(0)
   }
 
   // Re-encode one outlier clip to display correctly through the target's track transform:
@@ -1838,32 +1877,39 @@ extension VideoTrim {
   // conformed to keep the output track predictable. The transpose mapping is anchored
   // empirically (host-validated): preferredTransform angle +90° (ffprobe rotation -90)
   // requires transpose=2 to map an upright frame into coded orientation.
-  private static func conform(_ clip: ClipInfo, to target: ClipInfo, bitrate: String, output: URL, completion: @escaping (Bool) -> Void) {
-    let swap = target.rotationDeg == 90 || target.rotationDeg == 270
-    let dispW = (swap ? target.codedH : target.codedW) & ~1
-    let dispH = (swap ? target.codedW : target.codedH) & ~1
-    let isHevc = codecFamily(target.vcodec) == "hevc"
+  // When `audioOnly` is true the clip's video already matches the target (codec family / coded
+  // size / rotation / fps), so we copy the video stream untouched and only conform the audio —
+  // a near-instant remux instead of a full transcode. The copied video keeps the target's
+  // rotation tag (unlike the re-encode, which bakes rotation in and strips the tag).
+  private static func conform(_ clip: ClipInfo, to target: ClipInfo, bitrate: String, audioOnly: Bool, output: URL, completion: @escaping (Bool) -> Void) {
+    var cmds = ["-i", clip.url.path, "-map", "0:v:0"]
+    if audioOnly {
+      cmds.append(contentsOf: ["-c:v", "copy"])
+    } else {
+      let swap = target.rotationDeg == 90 || target.rotationDeg == 270
+      let dispW = (swap ? target.codedH : target.codedW) & ~1
+      let dispH = (swap ? target.codedW : target.codedH) & ~1
+      let isHevc = codecFamily(target.vcodec) == "hevc"
 
-    var filters = [
-      "scale=\(dispW):\(dispH):force_original_aspect_ratio=decrease",
-      "pad=\(dispW):\(dispH):(ow-iw)/2:(oh-ih)/2",
-      "setsar=1",
-      "fps=\(target.fps)",
-      "format=yuv420p",
-    ]
-    switch target.rotationDeg {
-    case 90: filters.append("transpose=2")
-    case 270: filters.append("transpose=1")
-    case 180: filters.append("hflip"); filters.append("vflip")
-    default: break
+      var filters = [
+        "scale=\(dispW):\(dispH):force_original_aspect_ratio=decrease",
+        "pad=\(dispW):\(dispH):(ow-iw)/2:(oh-ih)/2",
+        "setsar=1",
+      ]
+      // Only resample frame rate when it actually differs — avoids needless frame resampling.
+      if clip.fps != target.fps { filters.append("fps=\(target.fps)") }
+      filters.append("format=yuv420p")
+      switch target.rotationDeg {
+      case 90: filters.append("transpose=2")
+      case 270: filters.append("transpose=1")
+      case 180: filters.append("hflip"); filters.append("vflip")
+      default: break
+      }
+      cmds.append(contentsOf: ["-vf", filters.joined(separator: ","),
+                               "-c:v", isHevc ? "hevc_videotoolbox" : "h264_videotoolbox",
+                               "-b:v", bitrate])
+      if isHevc { cmds.append(contentsOf: ["-tag:v", "hvc1"]) }
     }
-
-    var cmds = ["-i", clip.url.path,
-                "-map", "0:v:0",
-                "-vf", filters.joined(separator: ","),
-                "-c:v", isHevc ? "hevc_videotoolbox" : "h264_videotoolbox",
-                "-b:v", bitrate]
-    if isHevc { cmds.append(contentsOf: ["-tag:v", "hvc1"]) }
     if target.hasAudio && clip.hasAudio {
       cmds.append(contentsOf: ["-map", "0:a:0", "-c:a", "aac", "-ar", "\(target.audioRate)", "-ac", "\(target.audioCh)"])
     } else {
