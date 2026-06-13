@@ -440,6 +440,11 @@ export interface Spec extends TurboModule {
     bitrate: number;
     speed: number;
   }>;
+  /** Emitted during a headless merge with overall progress in `[0, 1]`. */
+  readonly onMergeProgress: EventEmitter<{
+    /** Overall merge progress as a fraction from `0` to `1`. */
+    progress: number;
+  }>;
   /** Emitted when an error occurs during trimming or file loading. */
   readonly onError: EventEmitter<{
     message: string;

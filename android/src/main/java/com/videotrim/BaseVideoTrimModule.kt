@@ -1025,6 +1025,7 @@ open class BaseVideoTrimModule internal constructor(
 
     val inputArgs = mutableListOf<String>()
     var maxBitrate = 0L
+    var totalDurationMs = 0
     for (i in 0 until n) {
       val urlStr = urls.getString(i) ?: continue
       inputArgs.addAll(listOf("-i", urlStr))
@@ -1033,6 +1034,7 @@ open class BaseVideoTrimModule internal constructor(
         retriever.setDataSource(reactApplicationContext, Uri.parse(urlStr))
         val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
         if (bitrate > maxBitrate) maxBitrate = bitrate
+        totalDurationMs += retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0
         retriever.release()
       } catch (_: Exception) {}
     }
@@ -1077,8 +1079,11 @@ open class BaseVideoTrimModule internal constructor(
 
     val callbacks = VideoTrimmerUtil.TrimCallbacks(
       onLog = { msg -> msg.getString("message")?.let { Log.d(TAG, "merge: $it") } },
-      onStatistics = { /* merge does not surface statistics */ },
-      onProgress = { /* merge does not surface progress */ },
+      onStatistics = { /* merge surfaces normalized progress via onProgress below */ },
+      onProgress = { pct ->
+        // pct is 0..100 (derived from videoDurationMs); normalize to [0,1] for onMergeProgress.
+        sendEvent("onMergeProgress", Arguments.createMap().apply { putDouble("progress", pct / 100.0) })
+      },
       onSuccess = {
         var duration = 0.0
         try {
@@ -1106,7 +1111,7 @@ open class BaseVideoTrimModule internal constructor(
     VideoTrimmerUtil.executeWithEncoderFallback(
       encoderConfigs = VideoTrimmerUtil.reEncodeEncoderConfigs(bitrateStr),
       buildCommand = buildCommand,
-      videoDurationMs = 0,
+      videoDurationMs = totalDurationMs,
       callbacks = callbacks,
     )
   }

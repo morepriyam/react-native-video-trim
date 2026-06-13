@@ -287,7 +287,9 @@ RCT_EXPORT_MODULE()
   NSMutableDictionary *dict = [NSMutableDictionary dictionary];
   dict[@"outputExt"] = options.outputExt();
 
-  [VideoTrimSwift merge:urls options:dict completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
+  [VideoTrimSwift merge:urls options:dict onProgress:^(double p) {
+    [self emitOnMergeProgress:@{ @"progress": @(p) }];
+  } completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
     if (result[@"error"]) {
       reject(@"ERR_MERGE", result[@"error"], [NSError errorWithDomain:@"" code:200 userInfo:nil]);
     } else {
@@ -361,6 +363,8 @@ RCT_EXPORT_MODULE()
     [self emitOnFinishTrimming:body];
   } else if ([eventName isEqualToString:@"onStatistics"]) {
     [self emitOnStatistics:body];
+  } else if ([eventName isEqualToString:@"onMergeProgress"]) {
+    [self emitOnMergeProgress:body];
   }
 }
 

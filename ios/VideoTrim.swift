@@ -1620,7 +1620,7 @@ extension VideoTrim {
     return comp
   }
 
-  private static func passthroughExport(_ asset: AVAsset, outputFile: URL, fileType: AVFileType, timeRange: CMTimeRange?, completion: @escaping (Bool) -> Void) {
+  private static func passthroughExport(_ asset: AVAsset, outputFile: URL, fileType: AVFileType, timeRange: CMTimeRange?, progress: ((Float) -> Void)? = nil, completion: @escaping (Bool) -> Void) {
     try? FileManager.default.removeItem(at: outputFile)
     guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
       completion(false)
@@ -1629,9 +1629,25 @@ extension VideoTrim {
     session.outputURL = outputFile
     session.outputFileType = fileType
     if let r = timeRange { session.timeRange = r }
+
+    // Poll the session at ~10 Hz for progress. AVAssetExportSession.progress advances even for the
+    // passthrough preset; the timer is cancelled the instant the export finishes so it never
+    // outlives the work.
+    var timer: DispatchSourceTimer?
+    if let progress = progress {
+      let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+      t.schedule(deadline: .now() + 0.1, repeating: 0.1)
+      t.setEventHandler { progress(session.progress) }
+      t.resume()
+      timer = t
+    }
+
     session.exportAsynchronously {
+      timer?.cancel()
       if session.status != .completed {
         NSLog("[passthrough] export failed (status \(session.status.rawValue)): \(session.error?.localizedDescription ?? "unknown error")")
+      } else {
+        progress?(1.0)
       }
       completion(session.status == .completed)
     }
@@ -1640,14 +1656,14 @@ extension VideoTrim {
   // Join clips losslessly and verify the assembled duration against the input sum — assembly
   // bugs (timescale/edit-list surprises) show up as duration drift, and a cheap probe here
   // turns "silent corruption" into "fallback to the safe path".
-  private static func joinWithComposition(_ urls: [URL], transform: CGAffineTransform, outputFile: URL, completion: @escaping (Bool) -> Void) {
+  private static func joinWithComposition(_ urls: [URL], transform: CGAffineTransform, outputFile: URL, progress: ((Float) -> Void)? = nil, completion: @escaping (Bool) -> Void) {
     var expected = 0.0
     for u in urls { expected += CMTimeGetSeconds(AVURLAsset(url: u).duration) }
     guard let comp = buildComposition(urls, transform: transform, includeAudio: true) else {
       completion(false)
       return
     }
-    passthroughExport(comp, outputFile: outputFile, fileType: .mp4, timeRange: nil) { ok in
+    passthroughExport(comp, outputFile: outputFile, fileType: .mp4, timeRange: nil, progress: progress) { ok in
       guard ok else { completion(false); return }
       let got = CMTimeGetSeconds(AVURLAsset(url: outputFile).duration)
       let tolerance = max(0.5, expected * 0.01)
@@ -1680,7 +1696,8 @@ extension VideoTrim {
   }
 
   @objc
-  public static func merge(_ urls: [String], options: NSDictionary, completion: @escaping ([String: Any]) -> Void) {
+  public static func merge(_ urls: [String], options: NSDictionary, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
+    onProgress(0)
     let outputExt = options["outputExt"] as? String ?? "mp4"
     let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_merged_\(timestamp).\(outputExt)"
@@ -1718,12 +1735,12 @@ extension VideoTrim {
     // clip count / total length for free.
     if fastEligible && uniform {
       let transform = AVURLAsset(url: inputURLs[0]).tracks(withMediaType: .video).first?.preferredTransform ?? .identity
-      joinWithComposition(inputURLs, transform: transform, outputFile: outputFile) { ok in
+      joinWithComposition(inputURLs, transform: transform, outputFile: outputFile, progress: { p in onProgress(Double(p)) }) { ok in
         if ok {
           respond(true, false)
         } else {
           NSLog("[merge] passthrough join failed; falling back to concat-filter re-encode")
-          mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+          mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
@@ -1735,18 +1752,18 @@ extension VideoTrim {
     // failure falls back to the full re-encode, so the worst case is exactly the old behavior.
     if fastEligible {
       let clips = infos.compactMap { $0 }
-      mergeSelective(clips, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp) { ok in
+      mergeSelective(clips, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp, onProgress: onProgress) { ok in
         if ok {
           respond(false, true)
         } else {
-          mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+          mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
     }
 
     // (3) Fallback: a clip couldn't be probed / non-mp4 output.
-    mergeWithFilter(inputURLs, outputFile: outputFile, completion: completion)
+    mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
   }
 
   // Normalized codec family for comparing a conform result against its target ("avc1"/"avc3"
@@ -1765,7 +1782,7 @@ extension VideoTrim {
   // cross-orientation imports conformable. Every conformed clip is re-probed and must match
   // the expected coded geometry exactly; any miss aborts to `completion(false)` so the caller
   // does the full re-encode instead.
-  private static func mergeSelective(_ clips: [ClipInfo], outputFile: URL, cacheDirectory: URL, timestamp: Int, completion: @escaping (Bool) -> Void) {
+  private static func mergeSelective(_ clips: [ClipInfo], outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
     // Dominant signature = most frequent; ties resolved by first occurrence (keeps the majority
     // — typically the recorder clips — as lossless copies).
     var counts: [String: Int] = [:]
@@ -1797,7 +1814,8 @@ extension VideoTrim {
 
     func finish(_ ok: Bool) {
       if ok, finalURLs.allSatisfy({ $0 != nil }) {
-        joinWithComposition(finalURLs.compactMap { $0 }, transform: targetTransform, outputFile: outputFile) { joined in
+        // Conforms occupy 0…0.85 of the bar; the final passthrough join fills the last 0.85…1.0.
+        joinWithComposition(finalURLs.compactMap { $0 }, transform: targetTransform, outputFile: outputFile, progress: { p in onProgress(0.85 + 0.15 * Double(p)) }) { joined in
           for t in tempFiles { try? FileManager.default.removeItem(at: t) }
           completion(joined)
         }
@@ -1836,6 +1854,7 @@ extension VideoTrim {
     let maxInFlight = 2
     let sem = DispatchSemaphore(value: maxInFlight)
     var anyFailed = false
+    var completedConforms = 0
 
     DispatchQueue.global(qos: .userInitiated).async {
       for (i, temp, audioOnly) in outliers {
@@ -1858,6 +1877,10 @@ extension VideoTrim {
           } else {
             NSLog("[merge] selective conform failed/verify-mismatch for clip \(i); falling back")
             syncQ.sync { anyFailed = true }
+          }
+          syncQ.sync {
+            completedConforms += 1
+            onProgress(0.85 * Double(completedConforms) / Double(outliers.count))
           }
           sem.signal()
           group.leave()
@@ -1923,14 +1946,16 @@ extension VideoTrim {
 
   // Re-encode concatenation via the concat *filter*. Normalizes every input to the first
   // clip's resolution/fps/SAR/pixel-format, so mismatched clips merge correctly (letterboxed).
-  private static func mergeWithFilter(_ inputURLs: [URL], outputFile: URL, completion: @escaping ([String: Any]) -> Void) {
+  private static func mergeWithFilter(_ inputURLs: [URL], outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
     let urls = inputURLs.map { $0.absoluteString }
     var cmds: [String] = []
     var maxBitrate: Int = 0
+    var totalMs = 0.0
     for urlStr in urls {
       let u = URL(string: urlStr) ?? URL(fileURLWithPath: urlStr)
       cmds.append(contentsOf: ["-i", u.path])
       let asset = AVURLAsset(url: u)
+      totalMs += CMTimeGetSeconds(asset.duration) * 1000
       if let track = asset.tracks(withMediaType: .video).first {
         maxBitrate = max(maxBitrate, Int(track.estimatedDataRate))
       }
@@ -1985,13 +2010,21 @@ extension VideoTrim {
         let logs = session?.getAllLogsAsString() ?? ""
         completion(["error": "Merge failed: rc \(String(describing: returnCode))\n\(logs)"])
       }
-    }, withLogCallback: nil, withStatisticsCallback: nil)
+    }, withLogCallback: nil, withStatisticsCallback: { statistics in
+      guard let statistics = statistics, totalMs > 0 else { return }
+      let timeInMs = statistics.getTime()
+      if timeInMs > 0 {
+        onProgress(min(1.0, timeInMs / totalMs))
+      }
+    })
   }
 
   // Old Arch
   @objc(merge:withOptions:withResolver:withRejecter:)
   func merge(_ urls: [String], withOptions options: NSDictionary, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
-    VideoTrim.merge(urls, options: options, completion: { payload in
+    VideoTrim.merge(urls, options: options, onProgress: { [weak self] p in
+      self?.emitEventToJS("onMergeProgress", eventData: ["progress": p])
+    }, completion: { payload in
       if let error = payload["error"] as? String {
         reject("ERR_MERGE", error, NSError(domain: "", code: 200, userInfo: nil))
       } else {

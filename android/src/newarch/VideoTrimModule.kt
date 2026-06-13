@@ -26,6 +26,7 @@ class VideoTrimModule(
         "onCancelTrimming" -> emitOnCancelTrimming()
         "onLog" -> emitOnLog(params)
         "onStatistics" -> emitOnStatistics(params)
+        "onMergeProgress" -> emitOnMergeProgress(params)
         "onError" -> emitOnError(params)
         "onLoad" -> emitOnLoad(params)
         // default case to handle unexpected event names
