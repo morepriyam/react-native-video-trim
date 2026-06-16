@@ -33,7 +33,9 @@ import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFprobeKit
 import com.arthenica.ffmpegkit.ReturnCode
+import com.arthenica.ffmpegkit.StreamInformation
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.BaseActivityEventListener
 import com.facebook.react.bridge.LifecycleEventListener
@@ -56,6 +58,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.min
 
@@ -67,6 +70,18 @@ open class BaseVideoTrimModule internal constructor(
   private val reactApplicationContext: ReactApplicationContext,
   private val sendEvent: (eventName: String, params: WritableMap?) -> Unit
 ) : VideoTrimListener, LifecycleEventListener {
+
+  // iknow.android.utils (DeviceUtil/UnitConverter, read by VideoTrimmerUtil's static field
+  // initializers and by StorageUtil) resolves a context stashed via BaseUtils.init. The editor
+  // path inits it lazily in init(), but the headless merge()/trim()/extractAudio() paths touch
+  // VideoTrimmerUtil WITHOUT ever opening the editor — so without this, the first reference to
+  // VideoTrimmerUtil runs its <clinit> (DeviceUtil.getDeviceWidth on an uninitialized context)
+  // and throws ExceptionInInitializerError, failing every headless export. Init once at
+  // construction so all entry points are covered; BaseUtils.init only stores a WeakReference, so
+  // this is idempotent and harmless to repeat (the editor's init() still runs as before).
+  init {
+    BaseUtils.init(reactApplicationContext)
+  }
 
   private var isInit: Boolean = false
   private var trimmerView: VideoTrimmerView? = null
@@ -646,6 +661,9 @@ open class BaseVideoTrimModule internal constructor(
       result.putDouble("endTime", endTime)
       result.putDouble("duration", duration)
       result.putBoolean("success", true)
+      // Result-shape parity with iOS: Android has no AVFoundation passthrough trim, so this
+      // is always the FFmpeg path. Emit false so consumers branch identically across platforms.
+      result.putBoolean("usedPassthrough", false)
 
       if (options?.getBoolean("saveToPhoto") == true && options.getString("type") == "video") {
         Log.d(TAG, "Android trim: saveToPhoto is true, attempting to save to gallery")
@@ -1013,6 +1031,38 @@ open class BaseVideoTrimModule internal constructor(
   //
   // Limitation: only supports local file paths. Remote URLs are not supported because the
   // default FFmpegKit build does not include OpenSSL (--disable-openssl).
+  // Display (post-auto-rotate) WxH as FFmpeg will decode it, probed with FFprobe so it stays
+  // consistent with the scaler. Returns null if the probe fails or there's no video stream.
+  private fun probeDisplaySize(path: String): Pair<Int, Int>? {
+    return try {
+      val info = FFprobeKit.getMediaInformation(path).mediaInformation ?: return null
+      val v = info.streams?.firstOrNull { it.type == "video" } ?: return null
+      var w = (v.width ?: 0L).toInt()
+      var h = (v.height ?: 0L).toInt()
+      if (probeRotation(v) % 180 != 0) { val t = w; w = h; h = t }
+      if (w > 0 && h > 0) w to h else null
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  // Rotation degrees (0/90/180/270) from an FFprobe video stream. Reads the modern Display Matrix
+  // (side_data_list[].rotation, often signed e.g. -90) and falls back to the legacy tags.rotate.
+  private fun probeRotation(v: StreamInformation): Int {
+    try {
+      val props = v.allProperties ?: return 0
+      props.optJSONArray("side_data_list")?.let { sdl ->
+        for (i in 0 until sdl.length()) {
+          val o = sdl.optJSONObject(i) ?: continue
+          if (o.has("rotation")) return ((o.optInt("rotation") % 360) + 360) % 360
+        }
+      }
+      val rotate = props.optJSONObject("tags")?.optString("rotate")
+      if (!rotate.isNullOrEmpty()) return ((rotate.toInt() % 360) + 360) % 360
+    } catch (_: Exception) {}
+    return 0
+  }
+
   fun merge(urls: ReadableArray, options: ReadableMap?, promise: Promise) {
     val outputExt = options?.getString("outputExt") ?: "mp4"
     val outputFile = StorageUtil.getCacheOutputPath(reactApplicationContext, outputExt)
@@ -1026,6 +1076,10 @@ open class BaseVideoTrimModule internal constructor(
     val inputArgs = mutableListOf<String>()
     var maxBitrate = 0L
     var totalDurationMs = 0
+    val hasAudio = BooleanArray(n)
+    val durationsMs = IntArray(n)
+    // Display "WxH" signature per clip (rotation applied), used to pick the dominant geometry.
+    val sigs = arrayOfNulls<String>(n)
     for (i in 0 until n) {
       val urlStr = urls.getString(i) ?: continue
       inputArgs.addAll(listOf("-i", urlStr))
@@ -1034,46 +1088,106 @@ open class BaseVideoTrimModule internal constructor(
         retriever.setDataSource(reactApplicationContext, Uri.parse(urlStr))
         val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
         if (bitrate > maxBitrate) maxBitrate = bitrate
-        totalDurationMs += retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0
+        val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0
+        durationsMs[i] = dur
+        totalDurationMs += dur
+        hasAudio[i] = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
         retriever.release()
       } catch (_: Exception) {}
+      // Display geometry (what FFmpeg will actually decode after auto-rotation) is probed via
+      // FFprobe — the SAME engine that scales during the merge — NOT MediaMetadataRetriever.
+      // MMR proved unreliable on-device: it returns CODED dimensions and reports rotation=0 for
+      // files whose rotation lives in an mp4 Display Matrix (side data), so its dims disagree with
+      // what FFmpeg decodes and the canvas came out landscape (portrait clips pillarboxed). FFprobe
+      // reads the display matrix, so its dims+rotation stay consistent with the scaler.
+      val disp = probeDisplaySize(urlStr)
+      Log.d(TAG, "merge probe[$i]: FFprobe display=$disp")
+      if (disp != null) sigs[i] = "${disp.first}x${disp.second}"
     }
     val bitrateStr = if (maxBitrate > 0) "$maxBitrate" else "10M"
 
-    // Use the first clip's dimensions and frame rate as the target for all inputs.
+    // Target = the DOMINANT display geometry (most frequent; ties broken by first occurrence),
+    // mirroring the iOS engine. Using the first clip alone made the canvas depend on clip ORDER:
+    // a single landscape clip in slot 0 forced a landscape canvas that pillarboxed every portrait
+    // clip in the draft. The dominant geometry keeps the canvas matching the majority of the clips
+    // (for an all-recorded draft that's the recorder format), so the odd imported outlier is the
+    // one that letterboxes — not the whole export.
     var targetW = 1280; var targetH = 720
-    var targetFps = 30
-    try {
-      val retriever = MediaMetadataRetriever()
-      retriever.setDataSource(reactApplicationContext, Uri.parse(urls.getString(0)))
-      targetW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
-      targetH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
-      val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-      val fps = fpsStr?.toDoubleOrNull()?.let { kotlin.math.ceil(it).toInt() } ?: 30
-      targetFps = fps.coerceIn(1, 30)
-      retriever.release()
-    } catch (_: Exception) {}
+    val counts = LinkedHashMap<String, Int>()
+    for (i in 0 until n) { val s = sigs[i] ?: continue; counts[s] = (counts[s] ?: 0) + 1 }
+    // LinkedHashMap preserves first-seen order, and maxByOrNull returns the first max it meets,
+    // so ties resolve to the earliest-appearing signature (matches iOS).
+    counts.maxByOrNull { it.value }?.key?.split("x")?.let { (w, h) ->
+      targetW = w.toInt()
+      targetH = h.toInt()
+    }
+    // fps: METADATA_KEY_CAPTURE_FRAMERATE is generally unset off-iOS, so this defaults to 30 (the
+    // recorder's rate); the fps filter caps mixed-rate inputs to avoid frame-dup blowups.
+    val targetFps = 30
+
+    // Concat requires every segment to expose the same set of streams. A muted recording
+    // (mute={muted}) or a silent imported clip carries NO audio track, so referencing
+    // [i:a:0] for it makes FFmpeg fail the whole merge (this is why Android merge broke
+    // while iOS's AVMutableComposition path tolerated missing audio). For each audio-less
+    // input we synthesize a silent mono/48k track sized to that clip (matching the
+    // recorder's AAC mono 48k), and normalize every audio stream to mono/48k so concat's
+    // identical-params requirement holds across mixed sources. If EVERY input is silent we
+    // drop audio entirely rather than emit a spurious silent track (mirrors a no-audio iOS
+    // merge).
+    val anyAudio = (0 until n).any { hasAudio[it] }
+
+    // Silent lavfi inputs are appended after the n real inputs; track each one's ffmpeg
+    // input index so the concat pairs reference the right stream.
+    val silentInputArgs = mutableListOf<String>()
+    val audioSrcIndex = IntArray(n)
+    if (anyAudio) {
+      var nextInputIdx = n
+      for (i in 0 until n) {
+        if (hasAudio[i]) {
+          audioSrcIndex[i] = i
+        } else {
+          val durSec = (if (durationsMs[i] > 0) durationsMs[i] else 0) / 1000.0
+          silentInputArgs.addAll(listOf(
+            "-f", "lavfi", "-t", String.format(Locale.US, "%.3f", durSec),
+            "-i", "anullsrc=channel_layout=mono:sample_rate=48000",
+          ))
+          audioSrcIndex[i] = nextInputIdx
+          nextInputIdx++
+        }
+      }
+    }
 
     // Normalize each input to the same resolution, pixel format, SAR, and frame rate
     // before concat. The fps filter prevents massive frame duplication when inputs have
     // very different frame rates (e.g. 24fps + 60fps would cause thousands of dupes).
     val scaleFilter = "scale=$targetW:$targetH:force_original_aspect_ratio=decrease,pad=$targetW:$targetH:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=$targetFps"
     val scaleParts = (0 until n).joinToString(";") { "[$it:v:0]${scaleFilter}[v$it]" }
-    val concatInputs = (0 until n).joinToString("") { "[v$it][$it:a:0]" }
-    val filterComplex = "$scaleParts;${concatInputs}concat=n=$n:v=1:a=1[outv][outa]"
+
+    val filterComplex: String
+    val mapArgs: List<String>
+    if (anyAudio) {
+      val audioParts = (0 until n).joinToString(";") {
+        "[${audioSrcIndex[it]}:a:0]aformat=sample_rates=48000:channel_layouts=mono[a$it]"
+      }
+      val concatInputs = (0 until n).joinToString("") { "[v$it][a$it]" }
+      filterComplex = "$scaleParts;$audioParts;${concatInputs}concat=n=$n:v=1:a=1[outv][outa]"
+      mapArgs = listOf("-map", "[outv]", "-map", "[outa]")
+    } else {
+      val concatInputs = (0 until n).joinToString("") { "[v$it]" }
+      filterComplex = "$scaleParts;${concatInputs}concat=n=$n:v=1:a=0[outv]"
+      mapArgs = listOf("-map", "[outv]")
+    }
 
     val buildCommand: (List<String>) -> Array<String> = { encoderArgs ->
       val cmds = mutableListOf<String>()
       cmds.addAll(inputArgs)
-      cmds.addAll(listOf(
-        "-filter_complex", filterComplex,
-        "-map", "[outv]", "-map", "[outa]",
-      ))
+      cmds.addAll(silentInputArgs)
+      cmds.add("-filter_complex")
+      cmds.add(filterComplex)
+      cmds.addAll(mapArgs)
       cmds.addAll(encoderArgs)
-      cmds.addAll(listOf(
-        "-c:a", "aac",
-        "-y", outputFile,
-      ))
+      if (anyAudio) cmds.addAll(listOf("-c:a", "aac"))
+      cmds.addAll(listOf("-y", outputFile))
       cmds.toTypedArray()
     }
 
@@ -1096,6 +1210,12 @@ open class BaseVideoTrimModule internal constructor(
         val result = Arguments.createMap()
         result.putString("outputPath", outputFile)
         result.putDouble("duration", duration)
+        // Result-shape parity with iOS. Android has no AVFoundation perf engine yet, so it
+        // always takes the concat-filter re-encode path — neither the passthrough fast path
+        // nor selective outlier-conform. Emit the flags as false so cross-platform consumers
+        // (TS types, logging) branch identically. See docs/android-parity.md.
+        result.putBoolean("usedFastPath", false)
+        result.putBoolean("selective", false)
         promise.resolve(result)
       },
       onCancel = { promise.reject(Exception("Merge was cancelled")) },
