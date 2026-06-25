@@ -99,6 +99,10 @@ open class BaseVideoTrimModule internal constructor(
   private var pendingSaveToDocumentsFile: File? = null
 
   init {
+    // Initialize BaseUtils eagerly so DeviceUtil / VideoTrimmerUtil static
+    // fields resolve correctly even when a headless API (compress, toGif,
+    // merge, …) is called before showEditor has ever been opened.
+    BaseUtils.init(reactApplicationContext)
     reactApplicationContext.addLifecycleEventListener(this)
 
     val mActivityEventListener = object : BaseActivityEventListener() {
@@ -205,11 +209,6 @@ open class BaseVideoTrimModule internal constructor(
       onError("Activity is not available", ErrorCode.UNKNOWN)
       return
     }
-    if (!isInit) {
-      init()
-      isInit = true
-    }
-
     // here is NOT main thread, we need to create VideoTrimmerView on UI thread, so that later we can update it using same thread
     UiThreadUtil.runOnUiThread {
       trimmerView = VideoTrimmerView(reactApplicationContext, editorConfig, null)
@@ -303,12 +302,6 @@ open class BaseVideoTrimModule internal constructor(
       }
       ViewCompat.requestApplyInsets(decorView)
     }
-  }
-
-  private fun init() {
-    isInit = true
-    // we have to init this before create videoTrimmerView
-    BaseUtils.init(reactApplicationContext)
   }
 
   override fun onHostResume() {
@@ -722,7 +715,7 @@ open class BaseVideoTrimModule internal constructor(
       }
       cmds.addAll(listOf("-metadata", "creation_time=$formattedDateTime", resolvedOutputFile))
       VideoTrimmerUtil.executeWithEncoderFallback(
-        encoderConfigs = listOf(emptyList()),
+        encoderConfigs = listOf(VideoTrimmerUtil.EncoderConfig(emptyList())),
         buildCommand = { cmds.toTypedArray() },
         videoDurationMs = 0,
         callbacks = callbacks,
@@ -740,7 +733,7 @@ open class BaseVideoTrimModule internal constructor(
       retriever.release()
     } catch (_: Exception) {}
 
-    val buildCommand: (List<String>) -> Array<String> = { encoderArgs ->
+    val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
       // -y overwrites the output file without prompting, so the encoder fallback
       // chain's software retry can reuse the same output path left behind by the
       // failed hardware attempt instead of aborting on FFmpeg's overwrite prompt.
@@ -750,16 +743,25 @@ open class BaseVideoTrimModule internal constructor(
         "-to", "${endTime}ms",
         "-i", url,
       )
+      // Per-attempt filter chain: optional speed retime plus, on the mpeg4 software
+      // fallback only, a resolution cap so the output is decodable on-device.
+      val attemptFilters = mutableListOf<String>()
       if (speed != 1.0) {
-        cmds.addAll(listOf("-vf", "setpts=${1.0 / speed}*PTS"))
+        attemptFilters.add("setpts=${1.0 / speed}*PTS")
       }
-      cmds.addAll(encoderArgs)
+      config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
+      if (attemptFilters.isNotEmpty()) {
+        cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
+      }
+      cmds.addAll(config.args)
       when {
         removeAudio -> cmds.add("-an")
         speed != 1.0 -> cmds.addAll(listOf("-af", VideoTrimmerUtil.buildAtempoChain(speed)))
         else -> cmds.addAll(listOf("-c:a", "copy"))
       }
-      cmds.addAll(listOf("-metadata", "creation_time=$formattedDateTime", resolvedOutputFile))
+      // Same high-tbr fix as compress: prevents duplicate DTS on sources like Pixel 7
+      // recordings (45k tbr) when re-encoding with h264_mediacodec.
+      cmds.addAll(listOf("-fps_mode", "vfr", "-metadata", "creation_time=$formattedDateTime", resolvedOutputFile))
       cmds.toTypedArray()
     }
 
@@ -903,7 +905,6 @@ open class BaseVideoTrimModule internal constructor(
     } else if (height > 0) {
       videoFilters.add("scale=-2:$height")
     }
-    val filterString = videoFilters.joinToString(",")
 
     val bitrateStr = if (bitrate > 0) "${bitrate.toLong()}" else when (quality) {
       "low" -> "500K"
@@ -911,12 +912,17 @@ open class BaseVideoTrimModule internal constructor(
       else -> "2M"
     }
 
-    val buildCommand: (List<String>) -> Array<String> = { encoderArgs ->
+    val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
       val cmds = mutableListOf("-i", url)
-      if (filterString.isNotEmpty()) {
-        cmds.addAll(listOf("-vf", filterString))
+      // Per-attempt filter chain: any user-requested scale plus, on the mpeg4 software
+      // fallback only, a resolution cap so the output is decodable on-device. Android's
+      // software MPEG-4 decoder rejects full-resolution mpeg4 (NO_EXCEEDS_CAPABILITIES).
+      val attemptFilters = videoFilters.toMutableList()
+      config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
+      if (attemptFilters.isNotEmpty()) {
+        cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
       }
-      cmds.addAll(encoderArgs)
+      cmds.addAll(config.args)
       if (frameRate > 0) {
         cmds.addAll(listOf("-r", "$frameRate"))
       }
@@ -925,7 +931,11 @@ open class BaseVideoTrimModule internal constructor(
       } else {
         cmds.addAll(listOf("-c:a", "aac"))
       }
-      cmds.addAll(listOf("-y", outputFile))
+      // -fps_mode vfr prevents frame duplication / non-monotonic DTS errors that
+      // occur when the source has an unusually high time-base (e.g. Pixel 7 recordings
+      // with 45k tbr). Without this, h264_mediacodec tries to encode at the tbr rate,
+      // producing hundreds of duplicate frames and then a fatal muxer DTS collision.
+      cmds.addAll(listOf("-fps_mode", "vfr", "-y", outputFile))
       cmds.toTypedArray()
     }
 
@@ -1157,35 +1167,44 @@ open class BaseVideoTrimModule internal constructor(
       }
     }
 
-    // Normalize each input to the same resolution, pixel format, SAR, and frame rate
-    // before concat. The fps filter prevents massive frame duplication when inputs have
-    // very different frame rates (e.g. 24fps + 60fps would cause thousands of dupes).
-    val scaleFilter = "scale=$targetW:$targetH:force_original_aspect_ratio=decrease,pad=$targetW:$targetH:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=$targetFps"
-    val scaleParts = (0 until n).joinToString(";") { "[$it:v:0]${scaleFilter}[v$it]" }
+    val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
+      // On the mpeg4 software fallback only, clamp the normalization target so the long side
+      // stays within what Android's software MPEG-4 decoder can play back. merge scales via
+      // -filter_complex (not -vf), so the cap is applied to the target dimensions.
+      val (outW, outH) = config.maxLongSide
+        ?.let { VideoTrimmerUtil.capDimensionsToLongSide(targetW, targetH, it) }
+        ?: (targetW to targetH)
 
-    val filterComplex: String
-    val mapArgs: List<String>
-    if (anyAudio) {
-      val audioParts = (0 until n).joinToString(";") {
-        "[${audioSrcIndex[it]}:a:0]aformat=sample_rates=48000:channel_layouts=mono[a$it]"
+      // Normalize each input to the same resolution, pixel format, SAR, and frame rate
+      // before concat. The fps filter prevents massive frame duplication when inputs have
+      // very different frame rates (e.g. 24fps + 60fps would cause thousands of dupes).
+      val scaleFilter = "scale=$outW:$outH:force_original_aspect_ratio=decrease,pad=$outW:$outH:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=$targetFps"
+      val scaleParts = (0 until n).joinToString(";") { "[$it:v:0]${scaleFilter}[v$it]" }
+
+      // Inputs may lack audio: silent anullsrc tracks were appended (audioSrcIndex) so every
+      // input has an audio stream to concat. When NONE has audio, concat video-only.
+      val filterComplex: String
+      val mapArgs: List<String>
+      if (anyAudio) {
+        val audioParts = (0 until n).joinToString(";") {
+          "[${audioSrcIndex[it]}:a:0]aformat=sample_rates=48000:channel_layouts=mono[a$it]"
+        }
+        val concatInputs = (0 until n).joinToString("") { "[v$it][a$it]" }
+        filterComplex = "$scaleParts;$audioParts;${concatInputs}concat=n=$n:v=1:a=1[outv][outa]"
+        mapArgs = listOf("-map", "[outv]", "-map", "[outa]")
+      } else {
+        val concatInputs = (0 until n).joinToString("") { "[v$it]" }
+        filterComplex = "$scaleParts;${concatInputs}concat=n=$n:v=1:a=0[outv]"
+        mapArgs = listOf("-map", "[outv]")
       }
-      val concatInputs = (0 until n).joinToString("") { "[v$it][a$it]" }
-      filterComplex = "$scaleParts;$audioParts;${concatInputs}concat=n=$n:v=1:a=1[outv][outa]"
-      mapArgs = listOf("-map", "[outv]", "-map", "[outa]")
-    } else {
-      val concatInputs = (0 until n).joinToString("") { "[v$it]" }
-      filterComplex = "$scaleParts;${concatInputs}concat=n=$n:v=1:a=0[outv]"
-      mapArgs = listOf("-map", "[outv]")
-    }
 
-    val buildCommand: (List<String>) -> Array<String> = { encoderArgs ->
       val cmds = mutableListOf<String>()
       cmds.addAll(inputArgs)
       cmds.addAll(silentInputArgs)
       cmds.add("-filter_complex")
       cmds.add(filterComplex)
       cmds.addAll(mapArgs)
-      cmds.addAll(encoderArgs)
+      cmds.addAll(config.args)
       if (anyAudio) cmds.addAll(listOf("-c:a", "aac"))
       cmds.addAll(listOf("-y", outputFile))
       cmds.toTypedArray()
