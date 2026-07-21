@@ -894,6 +894,10 @@ open class BaseVideoTrimModule internal constructor(
     val frameRate = options?.getDouble("frameRate") ?: -1.0
     val outputExt = options?.getString("outputExt") ?: "mp4"
     val removeAudio = options?.hasKey("removeAudio") == true && options.getBoolean("removeAudio")
+    val codec = options?.getString("codec") ?: "h264"
+    val audioSampleRate = if (options?.hasKey("audioSampleRate") == true) options.getInt("audioSampleRate") else -1
+    val audioChannels = if (options?.hasKey("audioChannels") == true) options.getInt("audioChannels") else -1
+    val copyVideo = options?.hasKey("copyVideo") == true && options.getBoolean("copyVideo")
 
     val outputFile = StorageUtil.getCacheOutputPath(reactApplicationContext, outputExt)
 
@@ -905,6 +909,10 @@ open class BaseVideoTrimModule internal constructor(
     } else if (height > 0) {
       videoFilters.add("scale=-2:$height")
     }
+    // Cast to 8-bit 4:2:0 unconditionally on the re-encode path: MediaCodec
+    // encoders reject 10-bit input from HDR sources, and for 8-bit sources
+    // the filter negotiates to a no-op so SDR inputs pay no conversion cost.
+    videoFilters.add("format=yuv420p")
 
     val bitrateStr = if (bitrate > 0) "${bitrate.toLong()}" else when (quality) {
       "low" -> "500K"
@@ -912,30 +920,42 @@ open class BaseVideoTrimModule internal constructor(
       else -> "2M"
     }
 
+    // Audio args shared by the copy and re-encode paths: always AAC (matching
+    // the historical behavior of this method) plus optional -ar/-ac conform.
+    val audioArgs = if (removeAudio) listOf("-an") else buildList {
+      addAll(listOf("-c:a", "aac"))
+      if (audioSampleRate > 0) addAll(listOf("-ar", "$audioSampleRate"))
+      if (audioChannels > 0) addAll(listOf("-ac", "$audioChannels"))
+    }
+
     val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
       val cmds = mutableListOf("-i", url)
-      // Per-attempt filter chain: any user-requested scale plus, on the mpeg4 software
-      // fallback only, a resolution cap so the output is decodable on-device. Android's
-      // software MPEG-4 decoder rejects full-resolution mpeg4 (NO_EXCEEDS_CAPABILITIES).
-      val attemptFilters = videoFilters.toMutableList()
-      config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
-      if (attemptFilters.isNotEmpty()) {
-        cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
-      }
-      cmds.addAll(config.args)
-      if (frameRate > 0) {
-        cmds.addAll(listOf("-r", "$frameRate"))
-      }
-      if (removeAudio) {
-        cmds.add("-an")
+      if (copyVideo) {
+        // Audio-only conform: video is stream-copied untouched, so no filters,
+        // frame-rate, or encoder args apply.
+        cmds.addAll(listOf("-c:v", "copy"))
       } else {
-        cmds.addAll(listOf("-c:a", "aac"))
+        // Per-attempt filter chain: any user-requested scale plus, on the mpeg4 software
+        // fallback only, a resolution cap so the output is decodable on-device. Android's
+        // software MPEG-4 decoder rejects full-resolution mpeg4 (NO_EXCEEDS_CAPABILITIES).
+        val attemptFilters = videoFilters.toMutableList()
+        config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
+        cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
+        cmds.addAll(config.args)
+        if (frameRate > 0) {
+          cmds.addAll(listOf("-r", "$frameRate"))
+        }
       }
-      // -fps_mode vfr prevents frame duplication / non-monotonic DTS errors that
-      // occur when the source has an unusually high time-base (e.g. Pixel 7 recordings
-      // with 45k tbr). Without this, h264_mediacodec tries to encode at the tbr rate,
-      // producing hundreds of duplicate frames and then a fatal muxer DTS collision.
-      cmds.addAll(listOf("-fps_mode", "vfr", "-y", outputFile))
+      cmds.addAll(audioArgs)
+      if (copyVideo) {
+        cmds.addAll(listOf("-y", outputFile))
+      } else {
+        // -fps_mode vfr prevents frame duplication / non-monotonic DTS errors that
+        // occur when the source has an unusually high time-base (e.g. Pixel 7 recordings
+        // with 45k tbr). Without this, h264_mediacodec tries to encode at the tbr rate,
+        // producing hundreds of duplicate frames and then a fatal muxer DTS collision.
+        cmds.addAll(listOf("-fps_mode", "vfr", "-y", outputFile))
+      }
       cmds.toTypedArray()
     }
 
@@ -958,12 +978,102 @@ open class BaseVideoTrimModule internal constructor(
       },
     )
 
+    // copyVideo needs exactly one attempt (no encoder is opened); otherwise
+    // pick the fallback chain, led by the requested codec.
+    val encoderConfigs = when {
+      copyVideo -> listOf(VideoTrimmerUtil.EncoderConfig(emptyList()))
+      codec == "hevc" -> VideoTrimmerUtil.hevcFirstEncoderConfigs(bitrateStr)
+      else -> VideoTrimmerUtil.reEncodeEncoderConfigs(bitrateStr)
+    }
+
     VideoTrimmerUtil.executeWithEncoderFallback(
-      encoderConfigs = VideoTrimmerUtil.reEncodeEncoderConfigs(bitrateStr),
+      encoderConfigs = encoderConfigs,
       buildCommand = buildCommand,
       videoDurationMs = 0,
       callbacks = callbacks,
     )
+  }
+
+  // Container + per-stream metadata via FFprobe, mirroring the iOS
+  // implementation field-for-field so JS gets an identical shape on both
+  // platforms. FFprobe is the source of truth because it reports pixel format
+  // and color transfer — needed to detect 10-bit/HDR sources — and its
+  // rotation/fps semantics match what FFmpeg-based processing (compress/merge)
+  // will actually do with the file.
+  fun probeVideo(url: String, promise: Promise) {
+    // FFprobeKit.getMediaInformation blocks until the probe finishes; run it
+    // off the JS thread like the other blocking calls in this module.
+    Thread {
+      try {
+        val info = FFprobeKit.getMediaInformation(url)?.mediaInformation
+        if (info == null) {
+          UiThreadUtil.runOnUiThread { promise.reject(Exception("Failed to probe media: no media information")) }
+          return@Thread
+        }
+
+        val result = Arguments.createMap()
+        result.putBoolean("hasVideo", false)
+        result.putString("videoCodec", "")
+        result.putInt("width", -1)
+        result.putInt("height", -1)
+        result.putInt("rotation", 0)
+        result.putDouble("nominalFps", -1.0)
+        result.putDouble("averageFps", -1.0)
+        result.putDouble("bitrate", -1.0)
+        result.putString("pixelFormat", "")
+        result.putString("colorTransfer", "")
+        result.putBoolean("hasAudio", false)
+        result.putString("audioCodec", "")
+        result.putInt("audioSampleRate", -1)
+        result.putInt("audioChannels", -1)
+        result.putDouble("duration", -1.0)
+        result.putDouble("fileSize", -1.0)
+
+        info.duration?.toDoubleOrNull()?.let { result.putDouble("duration", it * 1000) }
+        info.size?.toDoubleOrNull()?.let { result.putDouble("fileSize", it) }
+
+        // Parses an FFprobe rational like "30000/1001" (or a plain number)
+        // into fps; returns -1 for missing/zero-denominator values like "0/0".
+        fun parseFps(s: String?): Double {
+          if (s.isNullOrEmpty()) return -1.0
+          val parts = s.split("/")
+          if (parts.size == 2) {
+            val num = parts[0].toDoubleOrNull() ?: return -1.0
+            val den = parts[1].toDoubleOrNull() ?: return -1.0
+            return if (den > 0 && num > 0) num / den else -1.0
+          }
+          val v = s.toDoubleOrNull() ?: return -1.0
+          return if (v > 0) v else -1.0
+        }
+
+        info.streams?.firstOrNull { it.type == "video" }?.let { v ->
+          result.putBoolean("hasVideo", true)
+          result.putString("videoCodec", v.codec ?: "")
+          result.putInt("width", (v.width ?: -1L).toInt())
+          result.putInt("height", (v.height ?: -1L).toInt())
+          result.putInt("rotation", probeRotation(v))
+          result.putDouble("nominalFps", parseFps(v.realFrameRate))
+          result.putDouble("averageFps", parseFps(v.averageFrameRate))
+          v.bitrate?.toDoubleOrNull()?.let { result.putDouble("bitrate", it) }
+          val props = v.allProperties
+          result.putString("pixelFormat", props?.optString("pix_fmt") ?: "")
+          result.putString("colorTransfer", props?.optString("color_transfer") ?: "")
+        }
+
+        info.streams?.firstOrNull { it.type == "audio" }?.let { a ->
+          result.putBoolean("hasAudio", true)
+          result.putString("audioCodec", a.codec ?: "")
+          a.sampleRate?.toIntOrNull()?.let { result.putInt("audioSampleRate", it) }
+          a.allProperties?.let { props ->
+            if (props.has("channels")) result.putInt("audioChannels", props.optInt("channels"))
+          }
+        }
+
+        UiThreadUtil.runOnUiThread { promise.resolve(result) }
+      } catch (e: Exception) {
+        UiThreadUtil.runOnUiThread { promise.reject(Exception("Failed to probe media: ${e.message}")) }
+      }
+    }.start()
   }
 
   // Two-pass GIF conversion: pass 1 generates an optimal color palette (palettegen),

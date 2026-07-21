@@ -86,6 +86,11 @@ class VideoTrimModule internal constructor(context: ReactApplicationContext) : V
   }
 
   @ReactMethod
+  override fun probeVideo(url: String, promise: Promise) {
+    base.probeVideo(url, promise)
+  }
+
+  @ReactMethod
   override fun toGif(url: String, options: ReadableMap?, promise: Promise) {
     base.toGif(url, options, promise)
   }

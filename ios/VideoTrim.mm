@@ -251,10 +251,26 @@ RCT_EXPORT_MODULE()
   dict[@"frameRate"] = @(options.frameRate());
   dict[@"outputExt"] = options.outputExt();
   dict[@"removeAudio"] = @(options.removeAudio());
+  dict[@"codec"] = options.codec();
+  dict[@"audioSampleRate"] = @(options.audioSampleRate());
+  dict[@"audioChannels"] = @(options.audioChannels());
+  dict[@"copyVideo"] = @(options.copyVideo());
 
   [VideoTrimSwift compress:url options:dict completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
     if (result[@"error"]) {
       reject(@"ERR_COMPRESS", result[@"error"], [NSError errorWithDomain:@"" code:200 userInfo:nil]);
+    } else {
+      resolve(result);
+    }
+  }];
+}
+
+- (void)probeVideo:(nonnull NSString *)url
+           resolve:(nonnull RCTPromiseResolveBlock)resolve
+            reject:(nonnull RCTPromiseRejectBlock)reject {
+  [VideoTrimSwift probeVideo:url completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
+    if (result[@"error"]) {
+      reject(@"ERR_PROBE_VIDEO", result[@"error"], [NSError errorWithDomain:@"" code:200 userInfo:nil]);
     } else {
       resolve(result);
     }
@@ -425,6 +441,8 @@ RCT_EXTERN_METHOD(extractAudio:(NSString*)url withOptions:(NSDictionary *)option
                   withRejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(compress:(NSString*)url withOptions:(NSDictionary *)options
                   withResolver:(RCTPromiseResolveBlock)resolve
+                  withRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(probeVideo:(NSString*)url withResolver:(RCTPromiseResolveBlock)resolve
                   withRejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(toGif:(NSString*)url withOptions:(NSDictionary *)options
                   withResolver:(RCTPromiseResolveBlock)resolve

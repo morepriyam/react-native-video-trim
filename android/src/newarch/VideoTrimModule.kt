@@ -83,6 +83,10 @@ class VideoTrimModule(
     base.compress(url, options, promise)
   }
 
+  override fun probeVideo(url: String, promise: Promise) {
+    base.probeVideo(url, promise)
+  }
+
   override fun toGif(url: String, options: ReadableMap, promise: Promise) {
     base.toGif(url, options, promise)
   }

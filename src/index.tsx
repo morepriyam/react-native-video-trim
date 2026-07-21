@@ -21,6 +21,7 @@ import type {
   ShareResult,
   TrimOptions,
   TrimResult,
+  VideoProbeResult,
 } from './NativeVideoTrim';
 import { processColor } from 'react-native';
 
@@ -53,6 +54,10 @@ function createCompressOptions(
     frameRate: -1,
     outputExt: 'mp4',
     removeAudio: false,
+    codec: 'h264',
+    audioSampleRate: -1,
+    audioChannels: -1,
+    copyVideo: false,
     ...overrides,
   };
 }
@@ -342,6 +347,22 @@ export function compress(
   options: Partial<CompressOptions> = {}
 ): Promise<CompressResult> {
   return VideoTrim.compress(url, createCompressOptions(options));
+}
+
+/**
+ * Probe a local media file's container and stream metadata (codec, coded
+ * dimensions, rotation, frame rates, bitrate, pixel format, color transfer,
+ * audio parameters) via FFprobe. Use this to decide whether an imported file
+ * needs normalization before entering a merge pipeline.
+ *
+ * @param {string} url: absolute non-empty file path
+ * @returns {Promise<VideoProbeResult>} A **Promise** which resolves to the probe result
+ */
+export function probeVideo(url: string): Promise<VideoProbeResult> {
+  if (!url?.trim().length) {
+    throw new Error('File path cannot be empty!');
+  }
+  return VideoTrim.probeVideo(url);
 }
 
 /**

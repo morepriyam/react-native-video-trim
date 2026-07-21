@@ -29,6 +29,8 @@ abstract class VideoTrimSpec internal constructor(context: ReactApplicationConte
 
   abstract fun compress(url: String, options: ReadableMap?, promise: Promise)
 
+  abstract fun probeVideo(url: String, promise: Promise)
+
   abstract fun toGif(url: String, options: ReadableMap?, promise: Promise)
 
   abstract fun merge(urls: ReadableArray, options: ReadableMap?, promise: Promise)

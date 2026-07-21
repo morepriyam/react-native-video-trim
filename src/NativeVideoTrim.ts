@@ -274,6 +274,26 @@ export interface CompressOptions {
   outputExt: string;
   /** When `true`, strips the audio track from the output. Default `false`. */
   removeAudio: boolean;
+  /**
+   * Video codec: `"h264"` (default) or `"hevc"`. Uses the platform hardware
+   * encoder (VideoToolbox on iOS, MediaCodec on Android). HEVC outputs are
+   * tagged `hvc1` so the MP4 plays on Apple players.
+   */
+  codec: string;
+  /**
+   * Target audio sample rate in Hz (e.g. `48000`). `-1` keeps the source rate.
+   * Audio is always encoded to AAC on this path.
+   */
+  audioSampleRate: number;
+  /** Target audio channel count (e.g. `2`). `-1` keeps the source layout. */
+  audioChannels: number;
+  /**
+   * When `true`, stream-copies the video track untouched and only processes
+   * audio — an audio-only conform (e.g. transcode Opus to AAC without paying
+   * for a video re-encode). Video options (`quality`, `bitrate`, `width`,
+   * `height`, `frameRate`, `codec`) are ignored. Default `false`.
+   */
+  copyVideo: boolean;
 }
 
 /**
@@ -282,6 +302,56 @@ export interface CompressOptions {
 export interface CompressResult {
   /** Absolute path to the compressed output file. */
   outputPath: string;
+}
+
+/**
+ * Result returned by {@link Spec.probeVideo}: container and per-stream
+ * metadata for a local media file, as reported by FFprobe. String fields are
+ * `""` and numeric fields `-1` when the value is unknown or absent.
+ */
+export interface VideoProbeResult {
+  /** `true` when the file contains a video stream. */
+  hasVideo: boolean;
+  /** Video codec name (e.g. `"h264"`, `"hevc"`, `"mpeg4"`, `"vp9"`). */
+  videoCodec: string;
+  /** Coded (pre-rotation) width in pixels. */
+  width: number;
+  /** Coded (pre-rotation) height in pixels. */
+  height: number;
+  /**
+   * Display rotation in degrees (`0`, `90`, `180`, `270`), normalized to a
+   * positive value. Read from the stream's Display Matrix side data with a
+   * fallback to the legacy `rotate` tag.
+   */
+  rotation: number;
+  /** Nominal (container-declared) frame rate, e.g. `29.97`. `-1` if unknown. */
+  nominalFps: number;
+  /**
+   * Average frame rate over the whole stream. Differs from {@link nominalFps}
+   * on variable-frame-rate recordings. `-1` if unknown.
+   */
+  averageFps: number;
+  /** Video stream bitrate in bits per second. `-1` if the container does not declare it. */
+  bitrate: number;
+  /** Pixel format (e.g. `"yuv420p"`, `"yuv420p10le"` for 10-bit sources). */
+  pixelFormat: string;
+  /**
+   * Color transfer characteristics (e.g. `"bt709"` for SDR, `"arib-std-b67"`
+   * for HLG, `"smpte2084"` for PQ/HDR10 and Dolby Vision profiles 8.x).
+   */
+  colorTransfer: string;
+  /** `true` when the file contains an audio stream. */
+  hasAudio: boolean;
+  /** Audio codec name (e.g. `"aac"`, `"opus"`). `""` when there is no audio. */
+  audioCodec: string;
+  /** Audio sample rate in Hz. `-1` when there is no audio. */
+  audioSampleRate: number;
+  /** Audio channel count. `-1` when there is no audio. */
+  audioChannels: number;
+  /** Container duration in milliseconds. `-1` if unknown. */
+  duration: number;
+  /** File size in bytes. `-1` if unknown. */
+  fileSize: number;
 }
 
 /**
@@ -427,6 +497,8 @@ export interface Spec extends TurboModule {
   ): Promise<ExtractAudioResult>;
   /** Compress a video file to reduce its size. */
   compress(url: string, options: CompressOptions): Promise<CompressResult>;
+  /** Probe a local media file's container and stream metadata via FFprobe. */
+  probeVideo(url: string): Promise<VideoProbeResult>;
   /** Convert a video segment to an animated GIF. */
   toGif(url: string, options: GifOptions): Promise<GifResult>;
   /** Merge multiple media files into a single file. Headless only, no editor UI. */

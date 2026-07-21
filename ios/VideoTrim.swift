@@ -1472,6 +1472,10 @@ extension VideoTrim {
     let frameRate = options["frameRate"] as? Double ?? -1
     let outputExt = options["outputExt"] as? String ?? "mp4"
     let removeAudio = options["removeAudio"] as? Bool ?? false
+    let codec = options["codec"] as? String ?? "h264"
+    let audioSampleRate = options["audioSampleRate"] as? Int ?? -1
+    let audioChannels = options["audioChannels"] as? Int ?? -1
+    let copyVideo = options["copyVideo"] as? Bool ?? false
 
     let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(outputExt)"
@@ -1479,42 +1483,64 @@ extension VideoTrim {
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
 
     var cmds: [String] = ["-i", destPath.path]
-    var videoFilters: [String] = []
 
-    if width > 0 && height > 0 {
-      videoFilters.append("scale=\(width):\(height)")
-    } else if width > 0 {
-      videoFilters.append("scale=\(width):-2")
-    } else if height > 0 {
-      videoFilters.append("scale=-2:\(height)")
-    }
-
-    if !videoFilters.isEmpty {
-      cmds.append(contentsOf: ["-vf", videoFilters.joined(separator: ",")])
-    }
-
-    cmds.append(contentsOf: ["-c:v", "h264_videotoolbox"])
-
-    if bitrate > 0 {
-      cmds.append(contentsOf: ["-b:v", "\(Int(bitrate))"])
+    if copyVideo {
+      // Audio-only conform: the video track is stream-copied untouched. All
+      // video options (scale/quality/bitrate/frameRate/codec) are skipped.
+      cmds.append(contentsOf: ["-c:v", "copy"])
     } else {
-      let crf: String
-      switch quality {
-      case "low": crf = "28"
-      case "high": crf = "18"
-      default: crf = "23"
-      }
-      cmds.append(contentsOf: ["-global_quality", crf])
-    }
+      var videoFilters: [String] = []
 
-    if frameRate > 0 {
-      cmds.append(contentsOf: ["-r", "\(frameRate)"])
+      if width > 0 && height > 0 {
+        videoFilters.append("scale=\(width):\(height)")
+      } else if width > 0 {
+        videoFilters.append("scale=\(width):-2")
+      } else if height > 0 {
+        videoFilters.append("scale=-2:\(height)")
+      }
+
+      // Cast to 8-bit 4:2:0 unconditionally: on FFmpeg builds where the
+      // VideoToolbox encoders advertise a 10-bit input format, HDR/10-bit
+      // sources otherwise fail to open the encoder (same normalization the
+      // trim re-encode path applies). For 8-bit sources the filter negotiates
+      // to a no-op, so SDR inputs pay no conversion cost.
+      videoFilters.append("format=yuv420p")
+      cmds.append(contentsOf: ["-vf", videoFilters.joined(separator: ",")])
+
+      if codec == "hevc" {
+        // hvc1 tag so the MP4 plays on Apple players (which reject hev1).
+        cmds.append(contentsOf: ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1"])
+      } else {
+        cmds.append(contentsOf: ["-c:v", "h264_videotoolbox"])
+      }
+
+      if bitrate > 0 {
+        cmds.append(contentsOf: ["-b:v", "\(Int(bitrate))"])
+      } else {
+        let crf: String
+        switch quality {
+        case "low": crf = "28"
+        case "high": crf = "18"
+        default: crf = "23"
+        }
+        cmds.append(contentsOf: ["-global_quality", crf])
+      }
+
+      if frameRate > 0 {
+        cmds.append(contentsOf: ["-r", "\(frameRate)"])
+      }
     }
 
     if removeAudio {
       cmds.append("-an")
     } else {
       cmds.append(contentsOf: ["-c:a", "aac"])
+      if audioSampleRate > 0 {
+        cmds.append(contentsOf: ["-ar", "\(audioSampleRate)"])
+      }
+      if audioChannels > 0 {
+        cmds.append(contentsOf: ["-ac", "\(audioChannels)"])
+      }
     }
 
     cmds.append(contentsOf: ["-y", outputFile.path])
@@ -1537,6 +1563,129 @@ extension VideoTrim {
     VideoTrim.compress(url, options: options, completion: { payload in
       if let error = payload["error"] as? String {
         reject("ERR_COMPRESS", error, NSError(domain: "", code: 200, userInfo: nil))
+      } else {
+        resolve(payload)
+      }
+    })
+  }
+
+  // MARK: - Headless API: probeVideo
+  // Container + per-stream metadata via FFprobe, mirroring the Android
+  // implementation field-for-field so JS gets an identical shape on both
+  // platforms. FFprobe (not AVAsset) is the source of truth here because it
+  // reports pixel format and color transfer — needed to detect 10-bit/HDR
+  // sources — and its rotation/fps semantics match what FFmpeg-based
+  // processing (compress/merge) will actually do with the file.
+  @objc
+  public static func probeVideo(_ url: String, completion: @escaping ([String: Any]) -> Void) {
+    let destPath = URL(string: url) ?? URL(fileURLWithPath: url)
+
+    // FFprobeKit.getMediaInformation blocks until the probe finishes; run it
+    // off the JS/main thread like every other FFmpegKit call in this module.
+    DispatchQueue.global(qos: .userInitiated).async {
+      guard let session = FFprobeKit.getMediaInformation(destPath.path),
+            let info = session.getMediaInformation() else {
+        completion(["error": "Failed to probe media: no media information"])
+        return
+      }
+
+      // Parses an FFprobe rational like "30000/1001" (or a plain number) into
+      // fps; returns -1 for missing/zero-denominator values such as "0/0".
+      func parseFps(_ s: String?) -> Double {
+        guard let s = s, !s.isEmpty else { return -1 }
+        let parts = s.split(separator: "/")
+        if parts.count == 2, let num = Double(parts[0]), let den = Double(parts[1]) {
+          return den > 0 && num > 0 ? num / den : -1
+        }
+        if let v = Double(s), v > 0 { return v }
+        return -1
+      }
+
+      var result: [String: Any] = [
+        "hasVideo": false,
+        "videoCodec": "",
+        "width": -1,
+        "height": -1,
+        "rotation": 0,
+        "nominalFps": -1.0,
+        "averageFps": -1.0,
+        "bitrate": -1,
+        "pixelFormat": "",
+        "colorTransfer": "",
+        "hasAudio": false,
+        "audioCodec": "",
+        "audioSampleRate": -1,
+        "audioChannels": -1,
+        "duration": -1.0,
+        "fileSize": -1,
+      ]
+
+      if let durationStr = info.getDuration(), let seconds = Double(durationStr) {
+        result["duration"] = seconds * 1000
+      }
+      if let sizeStr = info.getSize(), let size = Int(sizeStr) {
+        result["fileSize"] = size
+      }
+
+      let streams = (info.getStreams() as? [StreamInformation]) ?? []
+
+      if let v = streams.first(where: { $0.getType() == "video" }) {
+        result["hasVideo"] = true
+        result["videoCodec"] = v.getCodec() ?? ""
+        result["width"] = v.getWidth()?.intValue ?? -1
+        result["height"] = v.getHeight()?.intValue ?? -1
+        result["nominalFps"] = parseFps(v.getRealFrameRate())
+        result["averageFps"] = parseFps(v.getAverageFrameRate())
+        if let bitrateStr = v.getBitrate(), let b = Int(bitrateStr) {
+          result["bitrate"] = b
+        }
+
+        let props = v.getAllProperties() ?? [:]
+        result["pixelFormat"] = props["pix_fmt"] as? String ?? ""
+        result["colorTransfer"] = props["color_transfer"] as? String ?? ""
+
+        // Rotation: modern Display Matrix side data first (signed degrees,
+        // e.g. -90), then the legacy tags.rotate fallback — the same order
+        // FFprobe consumers use on Android (see probeRotation there).
+        var rotation = 0
+        if let sideDataList = props["side_data_list"] as? [[AnyHashable: Any]] {
+          for sideData in sideDataList {
+            if let r = (sideData["rotation"] as? NSNumber)?.intValue {
+              rotation = ((r % 360) + 360) % 360
+              break
+            }
+          }
+        }
+        if rotation == 0,
+           let tags = props["tags"] as? [AnyHashable: Any],
+           let rotateStr = tags["rotate"] as? String, let r = Int(rotateStr) {
+          rotation = ((r % 360) + 360) % 360
+        }
+        result["rotation"] = rotation
+      }
+
+      if let a = streams.first(where: { $0.getType() == "audio" }) {
+        result["hasAudio"] = true
+        result["audioCodec"] = a.getCodec() ?? ""
+        if let rateStr = a.getSampleRate(), let rate = Int(rateStr) {
+          result["audioSampleRate"] = rate
+        }
+        let props = a.getAllProperties() ?? [:]
+        if let channels = (props["channels"] as? NSNumber)?.intValue {
+          result["audioChannels"] = channels
+        }
+      }
+
+      completion(result)
+    }
+  }
+
+  // Old Arch
+  @objc(probeVideo:withResolver:withRejecter:)
+  func probeVideo(_ url: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+    VideoTrim.probeVideo(url, completion: { payload in
+      if let error = payload["error"] as? String {
+        reject("ERR_PROBE_VIDEO", error, NSError(domain: "", code: 200, userInfo: nil))
       } else {
         resolve(payload)
       }

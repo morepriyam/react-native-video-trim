@@ -160,6 +160,17 @@ object VideoTrimmerUtil {
   )
 
   /**
+   * The [reEncodeEncoderConfigs] chain reordered to lead with the hardware
+   * HEVC encoder, for callers that explicitly request HEVC output (e.g.
+   * `compress` with `codec: "hevc"`). The H.264 and mpeg4 attempts stay in
+   * the chain so a device with a broken HEVC encoder still produces output.
+   */
+  internal fun hevcFirstEncoderConfigs(bitrateStr: String): List<EncoderConfig> {
+    val chain = reEncodeEncoderConfigs(bitrateStr)
+    return listOf(chain[1], chain[0], chain[2])
+  }
+
+  /**
    * Build an FFmpeg `scale` filter (for `-vf` chains) that downscales so the
    * frame's longer edge is at most [maxLongSide], preserving aspect ratio and
    * never upscaling. Both output dimensions are forced even (`-2`) as required

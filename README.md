@@ -8,6 +8,7 @@
   * [getFrameAt()](#getframeat)
   * [extractAudio()](#extractaudio)
   * [compress()](#compress)
+  * [probeVideo()](#probevideo)
   * [toGif()](#togif)
   * [merge()](#merge)
   * [mixAudio()](#mixaudio)
@@ -327,6 +328,10 @@ compress(url: string, options?: Partial<CompressOptions>): Promise<CompressResul
 | `frameRate` | `number` | `-1` | Target frame rate (`-1` to keep original) |
 | `outputExt` | `string` | `"mp4"` | Output file extension |
 | `removeAudio` | `boolean` | `false` | Strip audio from the output |
+| `codec` | `string` | `"h264"` | Video codec: `"h264"` or `"hevc"` (hardware-encoded, `hvc1`-tagged) |
+| `audioSampleRate` | `number` | `-1` | Target audio sample rate in Hz (`-1` to keep original) |
+| `audioChannels` | `number` | `-1` | Target audio channel count (`-1` to keep original) |
+| `copyVideo` | `boolean` | `false` | Stream-copy the video track and only process audio (audio-only conform) |
 
 **Example:**
 ```javascript
@@ -343,6 +348,66 @@ const { outputPath } = await compress('/path/to/video.mp4', {
   bitrate: 2_000_000,
   removeAudio: true,
 });
+
+// Normalize an import for a merge pipeline: cap to 1080p/30fps H.264
+// with 48 kHz stereo AAC audio. 10-bit/HDR sources are converted to
+// 8-bit SDR automatically on this path.
+const { outputPath } = await compress('/path/to/import.mp4', {
+  height: 1080,
+  frameRate: 30,
+  bitrate: 5_000_000,
+  audioSampleRate: 48_000,
+  audioChannels: 2,
+});
+
+// Audio-only conform: transcode Opus audio to AAC without re-encoding video
+const { outputPath } = await compress('/path/to/video.mp4', {
+  copyVideo: true,
+});
+```
+
+### probeVideo()
+
+Probe a local media file's container and stream metadata via FFprobe. Use this to decide whether an imported file needs normalization (via `compress()`) before entering a merge pipeline.
+
+```typescript
+probeVideo(url: string): Promise<VideoProbeResult>
+```
+
+**Result fields** (string fields are `""` and numeric fields `-1` when unknown/absent):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hasVideo` | `boolean` | Whether the file has a video stream |
+| `videoCodec` | `string` | Video codec name (e.g. `"h264"`, `"hevc"`) |
+| `width` / `height` | `number` | Coded (pre-rotation) dimensions in pixels |
+| `rotation` | `number` | Display rotation: `0`, `90`, `180`, or `270` |
+| `nominalFps` | `number` | Container-declared frame rate |
+| `averageFps` | `number` | Average frame rate (differs from nominal on VFR sources) |
+| `bitrate` | `number` | Video bitrate in bps |
+| `pixelFormat` | `string` | e.g. `"yuv420p"`, `"yuv420p10le"` (10-bit) |
+| `colorTransfer` | `string` | e.g. `"bt709"` (SDR), `"arib-std-b67"` (HLG), `"smpte2084"` (PQ) |
+| `hasAudio` | `boolean` | Whether the file has an audio stream |
+| `audioCodec` | `string` | Audio codec name (e.g. `"aac"`, `"opus"`) |
+| `audioSampleRate` | `number` | Audio sample rate in Hz |
+| `audioChannels` | `number` | Audio channel count |
+| `duration` | `number` | Container duration in milliseconds |
+| `fileSize` | `number` | File size in bytes |
+
+**Example:**
+```javascript
+import { probeVideo, compress } from 'react-native-video-trim';
+
+const probe = await probeVideo('/path/to/import.mp4');
+const isHDR = ['smpte2084', 'arib-std-b67'].includes(probe.colorTransfer);
+const is10Bit = probe.pixelFormat.includes('10le');
+
+if (isHDR || is10Bit || probe.averageFps > 33) {
+  const { outputPath } = await compress('/path/to/import.mp4', {
+    height: 1080,
+    frameRate: 30,
+  });
+}
 ```
 
 ### toGif()
