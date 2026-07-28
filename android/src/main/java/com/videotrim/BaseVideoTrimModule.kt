@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -774,9 +775,12 @@ open class BaseVideoTrimModule internal constructor(
   }
 
   // Extracts a single video frame as JPEG/PNG. Output goes to the cache directory.
-  // On API 27+ (O_MR1), uses getScaledFrameAtTime with the video's native dimensions
-  // to get full-resolution frames. The plain getFrameAtTime() on older APIs may return
-  // a reduced-resolution bitmap at the decoder's discretion.
+  // On API 27+ (O_MR1), uses getScaledFrameAtTime to decode directly at the target size
+  // (capped by maxWidth/maxHeight when given) — decoding 4K at full resolution just to
+  // downscale wastes memory and outright fails on SoCs whose hardware decoder can't
+  // extract high-res HEVC frames. When MediaMetadataRetriever still can't produce a
+  // bitmap (budget-device decoder limits), falls back to FFmpeg's software decoder,
+  // which is already bundled for trimming and has no such hardware constraints.
   fun getFrameAt(url: String, options: ReadableMap?, promise: Promise) {
     Thread {
       try {
@@ -795,12 +799,32 @@ open class BaseVideoTrimModule internal constructor(
         val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
         val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
 
-        var bitmap: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && videoWidth > 0 && videoHeight > 0) {
-          retriever.getScaledFrameAtTime(time * 1000, MediaMetadataRetriever.OPTION_CLOSEST, videoWidth, videoHeight)
-        } else {
-          retriever.getFrameAtTime(time * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
+        // Decode target: the video's native size shrunk to fit maxWidth/maxHeight (never upscaled).
+        var decodeW = videoWidth
+        var decodeH = videoHeight
+        if (videoWidth > 0 && videoHeight > 0 && (maxWidth > 0 || maxHeight > 0)) {
+          val ratioW = if (maxWidth > 0) maxWidth.toFloat() / videoWidth else 1f
+          val ratioH = if (maxHeight > 0) maxHeight.toFloat() / videoHeight else 1f
+          val ratio = min(min(ratioW, ratioH), 1f)
+          decodeW = (videoWidth * ratio).toInt().coerceAtLeast(1)
+          decodeH = (videoHeight * ratio).toInt().coerceAtLeast(1)
+        }
+
+        var bitmap: Bitmap? = try {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && decodeW > 0 && decodeH > 0) {
+            retriever.getScaledFrameAtTime(time * 1000, MediaMetadataRetriever.OPTION_CLOSEST, decodeW, decodeH)
+          } else {
+            retriever.getFrameAtTime(time * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
+          }
+        } catch (e: Exception) {
+          Log.w(TAG, "getFrameAt: MediaMetadataRetriever failed, will try FFmpeg fallback", e)
+          null
         }
         retriever.release()
+
+        if (bitmap == null) {
+          bitmap = getFrameViaFFmpeg(url, time, decodeW, decodeH)
+        }
 
         if (bitmap == null) {
           UiThreadUtil.runOnUiThread { promise.reject(Exception("Failed to extract frame")) }
@@ -844,6 +868,40 @@ open class BaseVideoTrimModule internal constructor(
         UiThreadUtil.runOnUiThread { promise.reject(Exception("Frame extraction failed: ${e.message}")) }
       }
     }.start()
+  }
+
+  // Software-decode fallback for getFrameAt: some SoCs' hardware decoders can't extract
+  // frames from high-resolution HEVC (MediaMetadataRetriever returns null), but FFmpeg's
+  // bundled software decoder can. Decodes one frame at `time` ms, scaled to fit
+  // decodeW x decodeH (when > 0), into a temp PNG, then loads it as a Bitmap.
+  // Synchronous — only call from a background thread. Returns null on failure.
+  private fun getFrameViaFFmpeg(url: String, time: Long, decodeW: Int, decodeH: Int): Bitmap? {
+    val tmp = File(reactApplicationContext.cacheDir, "${VideoTrimmerUtil.FILE_PREFIX}_frame_ffmpeg_${System.nanoTime()}.png")
+    try {
+      val cmds = mutableListOf(
+        "-ss", (time / 1000.0).toString(),
+        "-i", url,
+        "-frames:v", "1",
+      )
+      if (decodeW > 0 && decodeH > 0) {
+        // force_original_aspect_ratio keeps proportions within the box (matches getScaledFrameAtTime)
+        cmds.addAll(listOf("-vf", "scale=$decodeW:$decodeH:force_original_aspect_ratio=decrease"))
+      }
+      cmds.addAll(listOf("-y", tmp.absolutePath))
+      Log.d(TAG, "getFrameViaFFmpeg command: ${cmds.joinToString(" ")}")
+
+      val session = FFmpegKit.executeWithArguments(cmds.toTypedArray())
+      if (!ReturnCode.isSuccess(session.returnCode) || !tmp.exists() || tmp.length() == 0L) {
+        Log.w(TAG, "getFrameViaFFmpeg failed: rc ${session.returnCode}")
+        return null
+      }
+      return BitmapFactory.decodeFile(tmp.absolutePath)
+    } catch (e: Exception) {
+      Log.w(TAG, "getFrameViaFFmpeg failed", e)
+      return null
+    } finally {
+      tmp.delete()
+    }
   }
 
   // Strips the video track via FFmpeg -vn. Default output is m4a (AAC) because the
