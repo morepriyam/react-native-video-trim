@@ -184,6 +184,17 @@ object VideoTrimmerUtil {
     "scale='if(gt(iw,ih),min($maxLongSide,iw),-2)':'if(gt(iw,ih),-2,min($maxLongSide,ih))'"
 
   /**
+   * `-movflags +faststart` for MOV-family outputs: relocates the moov atom to the
+   * front so browsers/progressive HTTP players can start playback before the file
+   * fully downloads. Empty for other muxers (e.g. gif), where the private option
+   * would make FFmpeg fail.
+   */
+  internal fun faststartFlags(outputFile: String): List<String> =
+    if (outputFile.substringAfterLast('.', "").lowercase() in listOf("mp4", "mov", "m4v"))
+      listOf("-movflags", "+faststart")
+    else emptyList()
+
+  /**
    * Clamp explicit pixel [width]/[height] so the longer side is at most
    * [maxLongSide], preserving aspect ratio, never upscaling, and keeping both
    * dimensions even. Used by paths that scale via `-filter_complex` with fixed
@@ -447,6 +458,7 @@ object VideoTrimmerUtil {
       } else {
         cmds.addAll(listOf("-c", "copy"))
       }
+      cmds.addAll(faststartFlags(outputFile))
       cmds.addAll(listOf("-metadata", "creation_time=$formattedDateTime", outputFile))
       return executeWithEncoderFallback(
         encoderConfigs = listOf(EncoderConfig(emptyList())),
@@ -518,6 +530,7 @@ object VideoTrimmerUtil {
         speed != 1.0 -> cmds.addAll(listOf("-af", buildAtempoChain(speed)))
         else -> cmds.addAll(listOf("-c:a", "copy"))
       }
+      cmds.addAll(faststartFlags(outputFile))
       cmds.addAll(listOf("-metadata", "creation_time=$formattedDateTime", outputFile))
       cmds.toTypedArray()
     }
