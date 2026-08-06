@@ -714,6 +714,7 @@ open class BaseVideoTrimModule internal constructor(
       } else {
         cmds.addAll(listOf("-c", "copy"))
       }
+      cmds.addAll(VideoTrimmerUtil.faststartFlags(resolvedOutputFile))
       cmds.addAll(listOf("-metadata", "creation_time=$formattedDateTime", resolvedOutputFile))
       VideoTrimmerUtil.executeWithEncoderFallback(
         encoderConfigs = listOf(VideoTrimmerUtil.EncoderConfig(emptyList())),
@@ -762,6 +763,7 @@ open class BaseVideoTrimModule internal constructor(
       }
       // Same high-tbr fix as compress: prevents duplicate DTS on sources like Pixel 7
       // recordings (45k tbr) when re-encoding with h264_mediacodec.
+      cmds.addAll(VideoTrimmerUtil.faststartFlags(resolvedOutputFile))
       cmds.addAll(listOf("-fps_mode", "vfr", "-metadata", "creation_time=$formattedDateTime", resolvedOutputFile))
       cmds.toTypedArray()
     }
@@ -1005,6 +1007,7 @@ open class BaseVideoTrimModule internal constructor(
         }
       }
       cmds.addAll(audioArgs)
+      cmds.addAll(VideoTrimmerUtil.faststartFlags(outputFile))
       if (copyVideo) {
         cmds.addAll(listOf("-y", outputFile))
       } else {
@@ -1374,6 +1377,7 @@ open class BaseVideoTrimModule internal constructor(
       cmds.addAll(mapArgs)
       cmds.addAll(config.args)
       if (anyAudio) cmds.addAll(listOf("-c:a", "aac"))
+      cmds.addAll(VideoTrimmerUtil.faststartFlags(outputFile))
       cmds.addAll(listOf("-y", outputFile))
       cmds.toTypedArray()
     }
@@ -1487,8 +1491,10 @@ open class BaseVideoTrimModule internal constructor(
       "-filter_complex", filterComplex,
       "-map", "0:v", "-c:v", "copy",
       "-map", "[aout]", "-c:a", "aac",
-      "-shortest", "-y", outputFile,
+      "-shortest",
     ))
+    cmds.addAll(VideoTrimmerUtil.faststartFlags(outputFile))
+    cmds.addAll(listOf("-y", outputFile))
     Log.d(TAG, "mixAudio command: ${cmds.joinToString(" ")}")
 
     FFmpegKit.executeWithArgumentsAsync(cmds.toTypedArray(), { session ->

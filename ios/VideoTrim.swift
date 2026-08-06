@@ -143,6 +143,12 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
       return editorConfig?["outputExt"] as! String
     }
   }
+  // `-movflags +faststart` for MOV-family outputs: relocates the moov atom to the front
+  // so browsers/progressive HTTP players can start playback before the download finishes.
+  // Empty for other muxers (e.g. gif), where the private option would make FFmpeg fail.
+  private static func faststartFlags(for ext: String) -> [String] {
+    return ["mp4", "mov", "m4v"].contains(ext.lowercased()) ? ["-movflags", "+faststart"] : []
+  }
   private var openDocumentsOnFinish: Bool {
     get {
       return editorConfig?["openDocumentsOnFinish"] as! Bool
@@ -560,6 +566,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         bitrateStr,
       ])
       cmds.append(contentsOf: audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: playbackSpeed, info: mediaInfo))
+      cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
         "creation_time=\(dateTime)",
@@ -577,6 +584,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         // passthrough but transcode just the audio to AAC.
         cmds.append(contentsOf: ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"])
       }
+      cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
         "creation_time=\(dateTime)",
@@ -823,6 +831,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         bitrateStr,
       ])
       cmds.append(contentsOf: audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: speed, info: mediaInfo))
+      cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
         "creation_time=\(dateTime)",
@@ -840,6 +849,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         // passthrough but transcode just the audio to AAC.
         cmds.append(contentsOf: ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"])
       }
+      cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
         "creation_time=\(dateTime)",
@@ -1543,6 +1553,7 @@ extension VideoTrim {
       }
     }
 
+    cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputFile.pathExtension))
     cmds.append(contentsOf: ["-y", outputFile.path])
     print("compress command:", cmds.joined(separator: " "))
 
@@ -1891,6 +1902,10 @@ extension VideoTrim {
     }
     session.outputURL = outputFile
     session.outputFileType = fileType
+    // Relocate the moov atom to the front (faststart) so the exported file can start
+    // playing over progressive HTTP before it fully downloads. Costs a sub-second
+    // rewrite at finalize; samples are still copied without re-encoding.
+    session.shouldOptimizeForNetworkUse = true
     if let r = timeRange { session.timeRange = r }
 
     // Poll the session at ~10 Hz for progress. AVAssetExportSession.progress advances even for the
@@ -2255,8 +2270,9 @@ extension VideoTrim {
       "-map", "[outv]", "-map", "[outa]",
       "-c:v", "h264_videotoolbox", "-b:v", bitrateStr,
       "-c:a", "aac",
-      "-y", outputFile.path
     ])
+    cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputFile.pathExtension))
+    cmds.append(contentsOf: ["-y", outputFile.path])
     print("merge command:", cmds.joined(separator: " "))
 
     FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
@@ -2357,8 +2373,10 @@ extension VideoTrim {
       "-filter_complex", filterComplex,
       "-map", "0:v", "-c:v", "copy",
       "-map", "[aout]", "-c:a", "aac",
-      "-shortest", "-y", outputFile.path
+      "-shortest",
     ])
+    cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputFile.pathExtension))
+    cmds.append(contentsOf: ["-y", outputFile.path])
     print("mixAudio command:", cmds.joined(separator: " "))
 
     FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
