@@ -1805,6 +1805,11 @@ extension VideoTrim {
       let a = hasAudio ? "\(audioCodec):\(audioRate):\(audioCh)" : "none"
       return "\(vcodec):\(codedW)x\(codedH)r\(rotationDeg)@\(fps)|\(a)"
     }
+    // Display "WxH" (rotation applied) — the canvas key for dominant-geometry selection.
+    var displayGeom: String {
+      let swap = rotationDeg == 90 || rotationDeg == 270
+      return swap ? "\(codedH)x\(codedW)" : "\(codedW)x\(codedH)"
+    }
   }
 
   // Degrees for a PURE right-angle rotation transform, or nil for anything else (mirror/
@@ -2061,12 +2066,25 @@ extension VideoTrim {
   // the expected coded geometry exactly; any miss aborts to `completion(false)` so the caller
   // does the full re-encode instead.
   private static func mergeSelective(_ clips: [ClipInfo], outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
-    // Dominant signature = most frequent; ties resolved by first occurrence (keeps the majority
-    // — typically the recorder clips — as lossless copies).
+    // Canvas = dominant DISPLAY geometry (most frequent; ties → first occurrence), matching the
+    // Android engine. Counting full signatures alone degenerates to "first clip wins" when every
+    // clip's format is unique (common for imported drafts), making the export's orientation and
+    // resolution depend on clip ORDER — one landscape clip dragged to slot 0 flipped a whole
+    // portrait draft into a pillarboxed landscape canvas.
+    var geomCounts: [String: Int] = [:]
+    for c in clips { geomCounts[c.displayGeom, default: 0] += 1 }
+    let maxGeomCount = geomCounts.values.max() ?? 0
+    guard let domGeom = clips.first(where: { geomCounts[$0.displayGeom] == maxGeomCount })?.displayGeom else {
+      completion(false)
+      return
+    }
+    // Conform target = most frequent full signature WITHIN the dominant geometry (ties → first
+    // occurrence), keeping the largest possible subset as lossless copies.
+    let cohort = clips.filter { $0.displayGeom == domGeom }
     var counts: [String: Int] = [:]
-    for c in clips { counts[c.sig, default: 0] += 1 }
+    for c in cohort { counts[c.sig, default: 0] += 1 }
     let maxCount = counts.values.max() ?? 0
-    guard let target = clips.first(where: { counts[$0.sig] == maxCount }),
+    guard let target = cohort.first(where: { counts[$0.sig] == maxCount }),
           target.codedW > 0, target.codedH > 0,
           let targetTrack = AVURLAsset(url: target.url).tracks(withMediaType: .video).first else {
       completion(false)
@@ -2222,13 +2240,14 @@ extension VideoTrim {
     }, withLogCallback: nil, withStatisticsCallback: nil)
   }
 
-  // Re-encode concatenation via the concat *filter*. Normalizes every input to the first
-  // clip's resolution/fps/SAR/pixel-format, so mismatched clips merge correctly (letterboxed).
+  // Re-encode concatenation via the concat *filter*. Normalizes every input to the dominant
+  // display geometry, so mismatched clips merge correctly (letterboxed).
   private static func mergeWithFilter(_ inputURLs: [URL], outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
     let urls = inputURLs.map { $0.absoluteString }
     var cmds: [String] = []
     var maxBitrate: Int = 0
     var totalMs = 0.0
+    var displays: [(w: Int, h: Int, fps: Int)] = []
     for urlStr in urls {
       let u = URL(string: urlStr) ?? URL(fileURLWithPath: urlStr)
       cmds.append(contentsOf: ["-i", u.path])
@@ -2236,20 +2255,23 @@ extension VideoTrim {
       totalMs += CMTimeGetSeconds(asset.duration) * 1000
       if let track = asset.tracks(withMediaType: .video).first {
         maxBitrate = max(maxBitrate, Int(track.estimatedDataRate))
+        let size = track.naturalSize.applying(track.preferredTransform)
+        displays.append((w: Int(abs(size.width)), h: Int(abs(size.height)), fps: Int(ceil(track.nominalFrameRate))))
       }
     }
     let bitrateStr = maxBitrate > 0 ? "\(maxBitrate)" : "10M"
 
-    // Use the first clip's dimensions and frame rate as the target for all inputs.
-    let firstURL = URL(string: urls[0]) ?? URL(fileURLWithPath: urls[0])
-    let firstAsset = AVURLAsset(url: firstURL)
+    // Target = dominant display geometry (most frequent; ties → first occurrence) — the canvas
+    // must not depend on clip order (parity with mergeSelective and the Android engine).
     var targetW = 1280; var targetH = 720
     var targetFps = 30
-    if let track = firstAsset.tracks(withMediaType: .video).first {
-      let size = track.naturalSize.applying(track.preferredTransform)
-      targetW = Int(abs(size.width))
-      targetH = Int(abs(size.height))
-      targetFps = min(Int(ceil(track.nominalFrameRate)), 30)
+    var geomCounts: [String: Int] = [:]
+    for d in displays { geomCounts["\(d.w)x\(d.h)", default: 0] += 1 }
+    let maxGeomCount = geomCounts.values.max() ?? 0
+    if let dom = displays.first(where: { geomCounts["\($0.w)x\($0.h)"] == maxGeomCount }) {
+      targetW = dom.w
+      targetH = dom.h
+      targetFps = min(dom.fps, 30)
       if targetFps <= 0 { targetFps = 30 }
     }
 
