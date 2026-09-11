@@ -1428,6 +1428,26 @@ open class BaseVideoTrimModule internal constructor(
         // (TS types, logging) branch identically. See docs/android-parity.md.
         result.putBoolean("usedFastPath", false)
         result.putBoolean("selective", false)
+        // Pin verification: the emergency encoder rungs (hevc_mediacodec, long-side-capped
+        // mpeg4) can legitimately emit non-H.264 or downscaled output on devices whose H.264
+        // hardware encoder rejects configuration — a playable file beats a failed merge, but a
+        // pinned caller must be able to tell. `degraded` = the output missed the pinned
+        // canvas/codec (probe failure counts as a miss).
+        if (pinW > 0 && pinH > 0) {
+          val pinFamily =
+            if (options != null && options.hasKey("targetCodec") && options.getString("targetCodec")?.lowercase() == "hevc") "hevc"
+            else "h264"
+          var codecName = ""
+          try {
+            val v = FFprobeKit.getMediaInformation(outputFile)?.mediaInformation
+              ?.streams?.firstOrNull { it.type == "video" }
+            codecName = (v?.codec ?: "").lowercase()
+          } catch (_: Exception) {}
+          val disp = probeDisplaySize(outputFile)
+          val degraded = codecName != pinFamily || disp == null ||
+            disp.first != targetW || disp.second != targetH
+          result.putBoolean("degraded", degraded)
+        }
         promise.resolve(result)
       },
       onCancel = { promise.reject(Exception("Merge was cancelled")) },

@@ -424,6 +424,14 @@ export interface MergeResult {
    * stream-copying the rest. Mutually exclusive with `usedFastPath`.
    */
   selective?: boolean;
+  /**
+   * Only set when a target canvas was pinned: `true` when the produced file does NOT satisfy
+   * the pin (codec family / display size / fps / AAC audio). Happens when an emergency encoder
+   * fallback had to diverge — e.g. Android's `hevc_mediacodec` or long-side-capped MPEG-4 rungs
+   * on devices whose H.264 hardware encoder fails to configure. The file is still playable;
+   * the degraded-output policy (warn, server-side re-encode, reject) belongs to the caller.
+   */
+  degraded?: boolean;
 }
 
 /**
