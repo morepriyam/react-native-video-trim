@@ -455,7 +455,7 @@ merge(urls: string[], options?: Partial<MergeOptions>): Promise<MergeResult>
 
 **Returns:** `{ outputPath: string, duration: number }` (duration in milliseconds)
 
-> **Note:** Merge uses FFmpeg's concat filter with hardware-accelerated re-encoding (h264_videotoolbox on iOS, h264_mediacodec on Android). Input clips can have different codecs, resolutions, or frame rates — each input is automatically scaled, padded (letterboxed/pillarboxed), and frame-rate-normalized to match the first clip's dimensions and fps (capped at 30 fps). The output bitrate matches the highest-quality input to preserve quality.
+> **Note:** Merge uses FFmpeg's concat filter with hardware-accelerated re-encoding (h264_videotoolbox on iOS, h264_mediacodec on Android). Input clips can have different codecs, resolutions, or frame rates — each input is automatically scaled, padded (letterboxed/pillarboxed), and frame-rate-normalized to match the dominant display geometry across the inputs (most frequent dimensions; ties broken by first occurrence, so the canvas never depends on clip order; fps capped at 30). Apps with a fixed output contract can pin the canvas instead via `targetWidth`/`targetHeight` (+ optional `targetFps`/`targetCodec`) — clips already matching the pin join losslessly, everything else conforms into it. The output bitrate matches the highest-quality input to preserve quality.
 >
 > **Limitation:** Only **local file paths** are supported. Remote URLs are not supported because the default FFmpegKit build does not include OpenSSL.
 

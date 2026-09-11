@@ -58,6 +58,7 @@ function createCompressOptions(
     audioSampleRate: -1,
     audioChannels: -1,
     copyVideo: false,
+    letterbox: false,
     ...overrides,
   };
 }
