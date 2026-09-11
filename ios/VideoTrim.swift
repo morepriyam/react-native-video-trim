@@ -1810,6 +1810,21 @@ extension VideoTrim {
       let swap = rotationDeg == 90 || rotationDeg == 270
       return swap ? "\(codedH)x\(codedW)" : "\(codedW)x\(codedH)"
     }
+    // A clip "matches the pin" when its display geometry (and codec family / fps, if pinned)
+    // already conforms — such clips join losslessly through the pinned canvas.
+    func matches(_ p: TargetFormat) -> Bool {
+      displayGeom == "\(p.width)x\(p.height)"
+        && (p.codecFamily == nil || VideoTrim.codecFamily(vcodec) == p.codecFamily!)
+        && (p.fps == nil || fps == p.fps!)
+    }
+  }
+
+  // Caller-pinned output canvas (display size post-rotation + optional codec family / fps).
+  // When present the canvas is the app's contract, never inferred from the clips.
+  struct TargetFormat {
+    let width: Int, height: Int
+    let fps: Int?
+    let codecFamily: String?
   }
 
   // Degrees for a PURE right-angle rotation transform, or nil for anything else (mirror/
@@ -1994,6 +2009,16 @@ extension VideoTrim {
 
     let inputURLs = urls.map { URL(string: $0) ?? URL(fileURLWithPath: $0) }
 
+    // Optional pinned canvas from the caller (e.g. an always-portrait reels app).
+    var pinned: TargetFormat? = nil
+    if let w = (options["targetWidth"] as? NSNumber)?.intValue, w > 0,
+       let h = (options["targetHeight"] as? NSNumber)?.intValue, h > 0 {
+      let fps = (options["targetFps"] as? NSNumber)?.intValue ?? 0
+      pinned = TargetFormat(width: w & ~1, height: h & ~1,
+                            fps: fps > 0 ? fps : nil,
+                            codecFamily: (options["targetCodec"] as? String).map { codecFamily($0) })
+    }
+
     // Probe every input once and branch on how uniform they are. The passthrough engine
     // writes mp4 — any other requested container goes through the legacy path.
     let infos = inputURLs.map { probe($0) }
@@ -2001,6 +2026,8 @@ extension VideoTrim {
     let sigs = infos.map { $0?.sig }
     let uniform = allProbed && sigs.allSatisfy { $0 == sigs[0] }
     let fastEligible = allProbed && outputExt == "mp4"
+    // A pinned canvas gates the fast path: uniform clips that don't match the pin must conform.
+    let pinSatisfied = pinned == nil || (allProbed && infos[0]!.matches(pinned!))
 
     let respond: (_ usedFastPath: Bool, _ selective: Bool) -> Void = { usedFastPath, selective in
       let asset = AVURLAsset(url: outputFile)
@@ -2013,40 +2040,40 @@ extension VideoTrim {
       ])
     }
 
-    // (1) Fast path: every input shares one format signature → passthrough join. No decode,
-    // no encode, I/O-bound. The common case for our own recorder clips, and it scales to any
-    // clip count / total length for free.
-    if fastEligible && uniform {
+    // (1) Fast path: every input shares one format signature (and matches the pinned canvas,
+    // if any) → passthrough join. No decode, no encode, I/O-bound. The common case for our own
+    // recorder clips, and it scales to any clip count / total length for free.
+    if fastEligible && uniform && pinSatisfied {
       let transform = AVURLAsset(url: inputURLs[0]).tracks(withMediaType: .video).first?.preferredTransform ?? .identity
       joinWithComposition(inputURLs, transform: transform, outputFile: outputFile, progress: { p in onProgress(Double(p)) }) { ok in
         if ok {
           respond(true, false)
         } else {
           NSLog("[merge] passthrough join failed; falling back to concat-filter re-encode")
-          mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
+          mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
     }
 
-    // (2) Selective path: inputs are mixed — conform ONLY the outlier clips to the dominant
+    // (2) Selective path: inputs are mixed — conform ONLY the outlier clips to the target
     // format, then passthrough-join the set. A draft of recorder clips plus one imported
     // library clip re-encodes just that one clip, not all of them. Any conform/verify/join
     // failure falls back to the full re-encode, so the worst case is exactly the old behavior.
     if fastEligible {
       let clips = infos.compactMap { $0 }
-      mergeSelective(clips, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp, onProgress: onProgress) { ok in
+      mergeSelective(clips, pinned: pinned, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp, onProgress: onProgress) { ok in
         if ok {
           respond(false, true)
         } else {
-          mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
+          mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
     }
 
     // (3) Fallback: a clip couldn't be probed / non-mp4 output.
-    mergeWithFilter(inputURLs, outputFile: outputFile, onProgress: onProgress, completion: completion)
+    mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
   }
 
   // Normalized codec family for comparing a conform result against its target ("avc1"/"avc3"
@@ -2065,32 +2092,62 @@ extension VideoTrim {
   // cross-orientation imports conformable. Every conformed clip is re-probed and must match
   // the expected coded geometry exactly; any miss aborts to `completion(false)` so the caller
   // does the full re-encode instead.
-  private static func mergeSelective(_ clips: [ClipInfo], outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
-    // Canvas = dominant DISPLAY geometry (most frequent; ties → first occurrence), matching the
-    // Android engine. Counting full signatures alone degenerates to "first clip wins" when every
-    // clip's format is unique (common for imported drafts), making the export's orientation and
-    // resolution depend on clip ORDER — one landscape clip dragged to slot 0 flipped a whole
-    // portrait draft into a pillarboxed landscape canvas.
-    var geomCounts: [String: Int] = [:]
-    for c in clips { geomCounts[c.displayGeom, default: 0] += 1 }
-    let maxGeomCount = geomCounts.values.max() ?? 0
-    guard let domGeom = clips.first(where: { geomCounts[$0.displayGeom] == maxGeomCount })?.displayGeom else {
-      completion(false)
-      return
+  private static func mergeSelective(_ clips: [ClipInfo], pinned: TargetFormat?, outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
+    let target: ClipInfo
+    let targetTransform: CGAffineTransform
+    if let pin = pinned {
+      // Pinned canvas: the app's output contract. Clips matching the pin keep their exact coded
+      // form — the most frequent matching signature becomes the conform target so the largest
+      // subset stays lossless. If NOTHING matches, conform everything into a synthesized
+      // coded-upright target (rotation baked, no tag).
+      let candidates = clips.filter { $0.matches(pin) }
+      if let first = candidates.first {
+        var counts: [String: Int] = [:]
+        for c in candidates { counts[c.sig, default: 0] += 1 }
+        let maxCount = counts.values.max() ?? 0
+        let t = candidates.first(where: { counts[$0.sig] == maxCount }) ?? first
+        guard let tt = AVURLAsset(url: t.url).tracks(withMediaType: .video).first else {
+          completion(false)
+          return
+        }
+        target = t
+        targetTransform = tt.preferredTransform
+      } else {
+        target = ClipInfo(
+          url: clips[0].url,
+          codedW: pin.width, codedH: pin.height, rotationDeg: 0,
+          vcodec: pin.codecFamily == "hevc" ? "hvc1" : "avc1", fps: pin.fps ?? 30,
+          hasAudio: true, audioCodec: "aac", audioRate: 48000, audioCh: 2)
+        targetTransform = .identity
+      }
+    } else {
+      // Canvas = dominant DISPLAY geometry (most frequent; ties → first occurrence), matching the
+      // Android engine. Counting full signatures alone degenerates to "first clip wins" when every
+      // clip's format is unique (common for imported drafts), making the export's orientation and
+      // resolution depend on clip ORDER — one landscape clip dragged to slot 0 flipped a whole
+      // portrait draft into a pillarboxed landscape canvas.
+      var geomCounts: [String: Int] = [:]
+      for c in clips { geomCounts[c.displayGeom, default: 0] += 1 }
+      let maxGeomCount = geomCounts.values.max() ?? 0
+      guard let domGeom = clips.first(where: { geomCounts[$0.displayGeom] == maxGeomCount })?.displayGeom else {
+        completion(false)
+        return
+      }
+      // Conform target = most frequent full signature WITHIN the dominant geometry (ties → first
+      // occurrence), keeping the largest possible subset as lossless copies.
+      let cohort = clips.filter { $0.displayGeom == domGeom }
+      var counts: [String: Int] = [:]
+      for c in cohort { counts[c.sig, default: 0] += 1 }
+      let maxCount = counts.values.max() ?? 0
+      guard let t = cohort.first(where: { counts[$0.sig] == maxCount }),
+            t.codedW > 0, t.codedH > 0,
+            let tt = AVURLAsset(url: t.url).tracks(withMediaType: .video).first else {
+        completion(false)
+        return
+      }
+      target = t
+      targetTransform = tt.preferredTransform
     }
-    // Conform target = most frequent full signature WITHIN the dominant geometry (ties → first
-    // occurrence), keeping the largest possible subset as lossless copies.
-    let cohort = clips.filter { $0.displayGeom == domGeom }
-    var counts: [String: Int] = [:]
-    for c in cohort { counts[c.sig, default: 0] += 1 }
-    let maxCount = counts.values.max() ?? 0
-    guard let target = cohort.first(where: { counts[$0.sig] == maxCount }),
-          target.codedW > 0, target.codedH > 0,
-          let targetTrack = AVURLAsset(url: target.url).tracks(withMediaType: .video).first else {
-      completion(false)
-      return
-    }
-    let targetTransform = targetTrack.preferredTransform
 
     // Match the best source bitrate, but right-size it to the TARGET resolution: every conform
     // encodes into the target's coded geometry, so a 1080p target shouldn't inherit a 4K source's
@@ -2240,9 +2297,10 @@ extension VideoTrim {
     }, withLogCallback: nil, withStatisticsCallback: nil)
   }
 
-  // Re-encode concatenation via the concat *filter*. Normalizes every input to the dominant
-  // display geometry, so mismatched clips merge correctly (letterboxed).
-  private static func mergeWithFilter(_ inputURLs: [URL], outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
+  // Re-encode concatenation via the concat *filter*. Normalizes every input to the pinned
+  // canvas (if any) or the dominant display geometry, so mismatched clips merge correctly
+  // (letterboxed). Always writes h264 — this is the safe floor under the smarter paths.
+  private static func mergeWithFilter(_ inputURLs: [URL], pinned: TargetFormat?, outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
     let urls = inputURLs.map { $0.absoluteString }
     var cmds: [String] = []
     var maxBitrate: Int = 0
@@ -2261,18 +2319,25 @@ extension VideoTrim {
     }
     let bitrateStr = maxBitrate > 0 ? "\(maxBitrate)" : "10M"
 
-    // Target = dominant display geometry (most frequent; ties → first occurrence) — the canvas
-    // must not depend on clip order (parity with mergeSelective and the Android engine).
+    // Target = pinned canvas when the caller set one; otherwise dominant display geometry
+    // (most frequent; ties → first occurrence) — the canvas must not depend on clip order
+    // (parity with mergeSelective and the Android engine).
     var targetW = 1280; var targetH = 720
     var targetFps = 30
-    var geomCounts: [String: Int] = [:]
-    for d in displays { geomCounts["\(d.w)x\(d.h)", default: 0] += 1 }
-    let maxGeomCount = geomCounts.values.max() ?? 0
-    if let dom = displays.first(where: { geomCounts["\($0.w)x\($0.h)"] == maxGeomCount }) {
-      targetW = dom.w
-      targetH = dom.h
-      targetFps = min(dom.fps, 30)
-      if targetFps <= 0 { targetFps = 30 }
+    if let p = pinned {
+      targetW = p.width
+      targetH = p.height
+      if let f = p.fps { targetFps = min(f, 30) }
+    } else {
+      var geomCounts: [String: Int] = [:]
+      for d in displays { geomCounts["\(d.w)x\(d.h)", default: 0] += 1 }
+      let maxGeomCount = geomCounts.values.max() ?? 0
+      if let dom = displays.first(where: { geomCounts["\($0.w)x\($0.h)"] == maxGeomCount }) {
+        targetW = dom.w
+        targetH = dom.h
+        targetFps = min(dom.fps, 30)
+        if targetFps <= 0 { targetFps = 30 }
+      }
     }
 
     // Normalize each input to the same resolution, pixel format, SAR, and frame rate

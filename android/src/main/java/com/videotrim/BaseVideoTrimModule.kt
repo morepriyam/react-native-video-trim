@@ -1287,24 +1287,34 @@ open class BaseVideoTrimModule internal constructor(
     }
     val bitrateStr = if (maxBitrate > 0) "$maxBitrate" else "10M"
 
-    // Target = the DOMINANT display geometry (most frequent; ties broken by first occurrence),
+    // Target = the caller's pinned canvas when provided (e.g. an always-portrait reels app);
+    // otherwise the DOMINANT display geometry (most frequent; ties broken by first occurrence),
     // mirroring the iOS engine. Using the first clip alone made the canvas depend on clip ORDER:
     // a single landscape clip in slot 0 forced a landscape canvas that pillarboxed every portrait
     // clip in the draft. The dominant geometry keeps the canvas matching the majority of the clips
     // (for an all-recorded draft that's the recorder format), so the odd imported outlier is the
     // one that letterboxes — not the whole export.
     var targetW = 1280; var targetH = 720
-    val counts = LinkedHashMap<String, Int>()
-    for (i in 0 until n) { val s = sigs[i] ?: continue; counts[s] = (counts[s] ?: 0) + 1 }
-    // LinkedHashMap preserves first-seen order, and maxByOrNull returns the first max it meets,
-    // so ties resolve to the earliest-appearing signature (matches iOS).
-    counts.maxByOrNull { it.value }?.key?.split("x")?.let { (w, h) ->
-      targetW = w.toInt()
-      targetH = h.toInt()
+    val pinW = if (options != null && options.hasKey("targetWidth")) options.getInt("targetWidth") else 0
+    val pinH = if (options != null && options.hasKey("targetHeight")) options.getInt("targetHeight") else 0
+    if (pinW > 0 && pinH > 0) {
+      targetW = pinW and 1.inv()
+      targetH = pinH and 1.inv()
+    } else {
+      val counts = LinkedHashMap<String, Int>()
+      for (i in 0 until n) { val s = sigs[i] ?: continue; counts[s] = (counts[s] ?: 0) + 1 }
+      // LinkedHashMap preserves first-seen order, and maxByOrNull returns the first max it meets,
+      // so ties resolve to the earliest-appearing signature (matches iOS).
+      counts.maxByOrNull { it.value }?.key?.split("x")?.let { (w, h) ->
+        targetW = w.toInt()
+        targetH = h.toInt()
+      }
     }
     // fps: METADATA_KEY_CAPTURE_FRAMERATE is generally unset off-iOS, so this defaults to 30 (the
-    // recorder's rate); the fps filter caps mixed-rate inputs to avoid frame-dup blowups.
-    val targetFps = 30
+    // recorder's rate — or the pinned rate); the fps filter caps mixed-rate inputs to avoid
+    // frame-dup blowups.
+    val pinFps = if (options != null && options.hasKey("targetFps")) options.getInt("targetFps") else 0
+    val targetFps = if (pinFps > 0) minOf(pinFps, 30) else 30
 
     // Concat requires every segment to expose the same set of streams. A muted recording
     // (mute={muted}) or a silent imported clip carries NO audio track, so referencing

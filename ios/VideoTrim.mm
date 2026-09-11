@@ -302,6 +302,10 @@ RCT_EXPORT_MODULE()
        reject:(nonnull RCTPromiseRejectBlock)reject {
   NSMutableDictionary *dict = [NSMutableDictionary dictionary];
   dict[@"outputExt"] = options.outputExt();
+  if (options.targetWidth().has_value()) dict[@"targetWidth"] = @(options.targetWidth().value());
+  if (options.targetHeight().has_value()) dict[@"targetHeight"] = @(options.targetHeight().value());
+  if (options.targetFps().has_value()) dict[@"targetFps"] = @(options.targetFps().value());
+  if (options.targetCodec()) dict[@"targetCodec"] = options.targetCodec();
 
   [VideoTrimSwift merge:urls options:dict onProgress:^(double p) {
     [self emitOnMergeProgress:@{ @"progress": @(p) }];

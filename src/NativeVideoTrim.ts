@@ -382,6 +382,21 @@ export interface GifResult {
 export interface MergeOptions {
   /** Output file extension (e.g. `"mp4"`, `"wav"`). Default `"mp4"`. */
   outputExt: string;
+  /**
+   * Pin the output canvas to a fixed DISPLAY size (post-rotation), e.g. 1080×1920 for an
+   * always-portrait reels app. When set (both width and height), the canvas is never inferred
+   * from the clips: clips already matching the pin join losslessly, everything else is
+   * conformed (scaled + letterboxed/pillarboxed) into it.
+   */
+  targetWidth?: number;
+  targetHeight?: number;
+  /** With a pinned canvas: conform clips whose frame rate differs to this fps. */
+  targetFps?: number;
+  /**
+   * With a pinned canvas: output codec family, `"h264"` or `"hevc"`.
+   * (The full re-encode fallback path always writes h264.)
+   */
+  targetCodec?: string;
 }
 
 /**
