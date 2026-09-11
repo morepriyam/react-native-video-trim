@@ -255,6 +255,7 @@ RCT_EXPORT_MODULE()
   dict[@"audioSampleRate"] = @(options.audioSampleRate());
   dict[@"audioChannels"] = @(options.audioChannels());
   dict[@"copyVideo"] = @(options.copyVideo());
+  dict[@"letterbox"] = @(options.letterbox());
 
   [VideoTrimSwift compress:url options:dict completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
     if (result[@"error"]) {

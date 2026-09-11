@@ -958,12 +958,23 @@ open class BaseVideoTrimModule internal constructor(
     val audioSampleRate = if (options?.hasKey("audioSampleRate") == true) options.getInt("audioSampleRate") else -1
     val audioChannels = if (options?.hasKey("audioChannels") == true) options.getInt("audioChannels") else -1
     val copyVideo = options?.hasKey("copyVideo") == true && options.getBoolean("copyVideo")
+    val letterbox = options?.hasKey("letterbox") == true && options.getBoolean("letterbox")
 
     val outputFile = StorageUtil.getCacheOutputPath(reactApplicationContext, outputExt)
 
     val videoFilters = mutableListOf<String>()
     if (width > 0 && height > 0) {
-      videoFilters.add("scale=$width:$height")
+      if (letterbox) {
+        // Fit-and-pad onto an exact WxH canvas (post-autorotation), preserving aspect —
+        // for fixed-canvas pipelines (e.g. imports baked onto a portrait reels canvas).
+        val w = width and 1.inv()
+        val h = height and 1.inv()
+        videoFilters.add("scale=$w:$h:force_original_aspect_ratio=decrease")
+        videoFilters.add("pad=$w:$h:(ow-iw)/2:(oh-ih)/2")
+        videoFilters.add("setsar=1")
+      } else {
+        videoFilters.add("scale=$width:$height")
+      }
     } else if (width > 0) {
       videoFilters.add("scale=$width:-2")
     } else if (height > 0) {

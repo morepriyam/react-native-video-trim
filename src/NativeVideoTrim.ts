@@ -294,6 +294,13 @@ export interface CompressOptions {
    * `height`, `frameRate`, `codec`) are ignored. Default `false`.
    */
   copyVideo: boolean;
+  /**
+   * When `true` and both `width` and `height` are set, scale to FIT the WxH canvas
+   * (post-autorotation) and center-pad with black bars instead of stretching — the output is
+   * always exactly WxH. For fixed-canvas pipelines (e.g. baking imports onto a portrait reels
+   * canvas). Default `false`.
+   */
+  letterbox: boolean;
 }
 
 /**

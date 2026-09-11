@@ -1486,6 +1486,7 @@ extension VideoTrim {
     let audioSampleRate = options["audioSampleRate"] as? Int ?? -1
     let audioChannels = options["audioChannels"] as? Int ?? -1
     let copyVideo = options["copyVideo"] as? Bool ?? false
+    let letterbox = options["letterbox"] as? Bool ?? false
 
     let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(outputExt)"
@@ -1502,7 +1503,17 @@ extension VideoTrim {
       var videoFilters: [String] = []
 
       if width > 0 && height > 0 {
-        videoFilters.append("scale=\(width):\(height)")
+        if letterbox {
+          // Fit-and-pad onto an exact WxH canvas (post-autorotation), preserving aspect —
+          // for fixed-canvas pipelines (e.g. imports baked onto a portrait reels canvas).
+          let w = width & ~1
+          let h = height & ~1
+          videoFilters.append("scale=\(w):\(h):force_original_aspect_ratio=decrease")
+          videoFilters.append("pad=\(w):\(h):(ow-iw)/2:(oh-ih)/2")
+          videoFilters.append("setsar=1")
+        } else {
+          videoFilters.append("scale=\(width):\(height)")
+        }
       } else if width > 0 {
         videoFilters.append("scale=\(width):-2")
       } else if height > 0 {
@@ -1811,11 +1822,14 @@ extension VideoTrim {
       return swap ? "\(codedH)x\(codedW)" : "\(codedW)x\(codedH)"
     }
     // A clip "matches the pin" when its display geometry (and codec family / fps, if pinned)
-    // already conforms — such clips join losslessly through the pinned canvas.
+    // already conforms — such clips join losslessly through the pinned canvas. Audio must be
+    // AAC (or absent): a pinned canvas is a web-playback contract, so non-AAC audio always
+    // conforms rather than riding a lossless path into the output.
     func matches(_ p: TargetFormat) -> Bool {
       displayGeom == "\(p.width)x\(p.height)"
         && (p.codecFamily == nil || VideoTrim.codecFamily(vcodec) == p.codecFamily!)
         && (p.fps == nil || fps == p.fps!)
+        && (!hasAudio || audioCodec.lowercased().hasPrefix("aac"))
     }
   }
 
@@ -2092,6 +2106,16 @@ extension VideoTrim {
   // cross-orientation imports conformable. Every conformed clip is re-probed and must match
   // the expected coded geometry exactly; any miss aborts to `completion(false)` so the caller
   // does the full re-encode instead.
+  // A silent clip must never define the conform target's AUDIO spec when the draft has sound —
+  // conform() emits `-an` for a no-audio target, silently stripping every other clip's track.
+  // Adopt the first audio-bearing clip's params instead (the video spec stays the pick's).
+  private static func audioSafeTarget(_ t: ClipInfo, clips: [ClipInfo]) -> ClipInfo {
+    guard !t.hasAudio, let a = clips.first(where: { $0.hasAudio }) else { return t }
+    return ClipInfo(url: t.url, codedW: t.codedW, codedH: t.codedH, rotationDeg: t.rotationDeg,
+                    vcodec: t.vcodec, fps: t.fps,
+                    hasAudio: true, audioCodec: a.audioCodec, audioRate: a.audioRate, audioCh: a.audioCh)
+  }
+
   private static func mergeSelective(_ clips: [ClipInfo], pinned: TargetFormat?, outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
     let target: ClipInfo
     let targetTransform: CGAffineTransform
@@ -2105,12 +2129,15 @@ extension VideoTrim {
         var counts: [String: Int] = [:]
         for c in candidates { counts[c.sig, default: 0] += 1 }
         let maxCount = counts.values.max() ?? 0
-        let t = candidates.first(where: { counts[$0.sig] == maxCount }) ?? first
+        // Among the most frequent signatures, prefer an audio-bearing one (a silent import
+        // tied with a recorded clip must not win the target and mute the export).
+        let t = candidates.first(where: { counts[$0.sig] == maxCount && $0.hasAudio })
+          ?? candidates.first(where: { counts[$0.sig] == maxCount }) ?? first
         guard let tt = AVURLAsset(url: t.url).tracks(withMediaType: .video).first else {
           completion(false)
           return
         }
-        target = t
+        target = audioSafeTarget(t, clips: clips)
         targetTransform = tt.preferredTransform
       } else {
         target = ClipInfo(
@@ -2139,13 +2166,15 @@ extension VideoTrim {
       var counts: [String: Int] = [:]
       for c in cohort { counts[c.sig, default: 0] += 1 }
       let maxCount = counts.values.max() ?? 0
-      guard let t = cohort.first(where: { counts[$0.sig] == maxCount }),
+      let picked = cohort.first(where: { counts[$0.sig] == maxCount && $0.hasAudio })
+        ?? cohort.first(where: { counts[$0.sig] == maxCount })
+      guard let t = picked,
             t.codedW > 0, t.codedH > 0,
             let tt = AVURLAsset(url: t.url).tracks(withMediaType: .video).first else {
         completion(false)
         return
       }
-      target = t
+      target = audioSafeTarget(t, clips: clips)
       targetTransform = tt.preferredTransform
     }
 
@@ -2306,11 +2335,16 @@ extension VideoTrim {
     var maxBitrate: Int = 0
     var totalMs = 0.0
     var displays: [(w: Int, h: Int, fps: Int)] = []
+    var hasAudio: [Bool] = []
+    var durationsSec: [Double] = []
     for urlStr in urls {
       let u = URL(string: urlStr) ?? URL(fileURLWithPath: urlStr)
       cmds.append(contentsOf: ["-i", u.path])
       let asset = AVURLAsset(url: u)
-      totalMs += CMTimeGetSeconds(asset.duration) * 1000
+      let dur = CMTimeGetSeconds(asset.duration)
+      durationsSec.append(dur)
+      totalMs += dur * 1000
+      hasAudio.append(!asset.tracks(withMediaType: .audio).isEmpty)
       if let track = asset.tracks(withMediaType: .video).first {
         maxBitrate = max(maxBitrate, Int(track.estimatedDataRate))
         let size = track.naturalSize.applying(track.preferredTransform)
@@ -2340,24 +2374,53 @@ extension VideoTrim {
       }
     }
 
+    // Concat requires every segment to expose the same stream set AND identical audio params.
+    // Synthesize a silent stereo/48k leg for audio-less inputs (lavfi inputs appended after the
+    // real ones) and aformat-normalize every audio leg — the Android engine hit both failure
+    // modes on-device. If NO input has audio, concat video-only.
+    let n = urls.count
+    let anyAudio = hasAudio.contains(true)
+    var audioSrcIndex = [Int](repeating: 0, count: n)
+    if anyAudio {
+      var nextInputIdx = n
+      for i in 0..<n {
+        if hasAudio[i] {
+          audioSrcIndex[i] = i
+        } else {
+          cmds.append(contentsOf: ["-f", "lavfi", "-t", String(format: "%.3f", max(durationsSec[i], 0)),
+                                   "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+          audioSrcIndex[i] = nextInputIdx
+          nextInputIdx += 1
+        }
+      }
+    }
+
     // Normalize each input to the same resolution, pixel format, SAR, and frame rate
     // before concat. The fps filter prevents massive frame duplication when inputs have
     // very different frame rates (e.g. 24fps + 60fps would cause thousands of dupes).
-    let n = urls.count
     let scaleFilter = "scale=\(targetW):\(targetH):force_original_aspect_ratio=decrease,pad=\(targetW):\(targetH):(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=\(targetFps)"
     var scaleParts: [String] = []
     for i in 0..<n {
       scaleParts.append("[\(i):v:0]\(scaleFilter)[v\(i)]")
     }
-    let concatInputs = (0..<n).map { "[v\($0)][\($0):a:0]" }.joined()
-    let filterComplex = scaleParts.joined(separator: ";") + ";" + concatInputs + "concat=n=\(n):v=1:a=1[outv][outa]"
 
-    cmds.append(contentsOf: [
-      "-filter_complex", filterComplex,
-      "-map", "[outv]", "-map", "[outa]",
-      "-c:v", "h264_videotoolbox", "-b:v", bitrateStr,
-      "-c:a", "aac",
-    ])
+    let filterComplex: String
+    let mapArgs: [String]
+    if anyAudio {
+      let audioParts = (0..<n).map { "[\(audioSrcIndex[$0]):a:0]aformat=sample_rates=48000:channel_layouts=stereo[a\($0)]" }.joined(separator: ";")
+      let concatInputs = (0..<n).map { "[v\($0)][a\($0)]" }.joined()
+      filterComplex = scaleParts.joined(separator: ";") + ";" + audioParts + ";" + concatInputs + "concat=n=\(n):v=1:a=1[outv][outa]"
+      mapArgs = ["-map", "[outv]", "-map", "[outa]"]
+    } else {
+      let concatInputs = (0..<n).map { "[v\($0)]" }.joined()
+      filterComplex = scaleParts.joined(separator: ";") + ";" + concatInputs + "concat=n=\(n):v=1:a=0[outv]"
+      mapArgs = ["-map", "[outv]"]
+    }
+
+    cmds.append(contentsOf: ["-filter_complex", filterComplex])
+    cmds.append(contentsOf: mapArgs)
+    cmds.append(contentsOf: ["-c:v", "h264_videotoolbox", "-b:v", bitrateStr])
+    if anyAudio { cmds.append(contentsOf: ["-c:a", "aac"]) }
     cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputFile.pathExtension))
     cmds.append(contentsOf: ["-y", outputFile.path])
     print("merge command:", cmds.joined(separator: " "))
