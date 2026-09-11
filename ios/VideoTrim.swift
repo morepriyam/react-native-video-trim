@@ -2046,12 +2046,19 @@ extension VideoTrim {
     let respond: (_ usedFastPath: Bool, _ selective: Bool) -> Void = { usedFastPath, selective in
       let asset = AVURLAsset(url: outputFile)
       let duration = CMTimeGetSeconds(asset.duration) * 1000
-      completion([
+      var payload: [String: Any] = [
         "outputPath": outputFile.absoluteString,
         "duration": duration.rounded(),
         "usedFastPath": usedFastPath,
         "selective": selective,
-      ])
+      ]
+      // Pin verification: surface an output that missed the pinned contract instead of
+      // returning it silently (the passthrough/selective paths verify conforms already, so
+      // this stays false on iOS unless something slipped; parity with the Android fallback).
+      if let pin = pinned {
+        payload["degraded"] = probe(outputFile).map { !$0.matches(pin) } ?? true
+      }
+      completion(payload)
     }
 
     // (1) Fast path: every input shares one format signature (and matches the pinned canvas,
@@ -2430,11 +2437,17 @@ extension VideoTrim {
       if ReturnCode.isSuccess(returnCode) {
         let asset = AVURLAsset(url: outputFile)
         let duration = CMTimeGetSeconds(asset.duration) * 1000
-        completion([
+        var payload: [String: Any] = [
           "outputPath": outputFile.absoluteString,
           "duration": duration.rounded(),
           "usedFastPath": false
-        ])
+        ]
+        // This path always writes h264 at the target dims — an hevc pin (or a probe failure)
+        // is the only way to miss it, but the caller still deserves to know.
+        if let pin = pinned {
+          payload["degraded"] = probe(outputFile).map { !$0.matches(pin) } ?? true
+        }
+        completion(payload)
       } else {
         let logs = session?.getAllLogsAsString() ?? ""
         completion(["error": "Merge failed: rc \(String(describing: returnCode))\n\(logs)"])
