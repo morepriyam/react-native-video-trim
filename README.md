@@ -129,32 +129,11 @@ cd android && ./gradlew generateCodegenArtifactsFromSchema
 <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 ```
 
-**For Share Sheet functionality**, add to `AndroidManifest.xml`:
-```xml
-<application>
-  <!-- your other configs -->
-  
-  <provider
-    android:name="androidx.core.content.FileProvider"
-    android:authorities="${applicationId}.provider"
-    android:exported="false"
-    android:grantUriPermissions="true">
-    <meta-data
-      android:name="android.support.FILE_PROVIDER_PATHS"
-      android:resource="@xml/file_paths" />
-  </provider>
-</application>
-```
+**For Share Sheet functionality**, no setup is required — the library bundles its own `FileProvider` (authority `${applicationId}.videotrimprovider`) and merges it into your manifest automatically. It serves only the app's `files/` and `cache/` directories, which is where every file the library produces lives.
 
-Create `android/app/src/main/res/xml/file_paths.xml`:
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<paths xmlns:android="http://schemas.android.com/apk/res/android">
-  <files-path name="internal_files" path="." />
-  <cache-path name="cache_files" path="." />
-  <external-path name="external_files" path="." />
-</paths>
-```
+> **Upgrading from 8.2.1 or earlier?** These docs used to ask you to declare a `FileProvider` with authority `${applicationId}.provider` plus a `res/xml/file_paths.xml`. The library no longer uses either, so you can delete them — unless your own code shares files through that authority, in which case leave them as they are. Both setups coexist safely.
+>
+> One behaviour change: if your `file_paths.xml` had an `external-path` root, `share()` used to accept paths on external storage. It no longer does — pass it a file from the library's own output directories instead.
 </details>
 
 <details>
@@ -1107,7 +1086,6 @@ export default function VideoTrimmer() {
 ### Common Issues
 
 **Android Build Errors:**
-- Ensure `file_paths.xml` exists for share functionality
 - Check SDK versions match your project requirements
 - Verify permissions in `AndroidManifest.xml`
 

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Roots served by VideoTrimFileProvider. Deliberately limited to the two
+  directories the library writes into — an external-path root here would let
+  share() hand out a content:// URI for any file on external storage.
+
+  Filename is namespaced on purpose: a plain file_paths.xml would be silently
+  overridden by any other library or app resource of the same name.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+  <files-path name="internal_files" path="." />
+  <cache-path name="cache_files" path="." />
+</paths>

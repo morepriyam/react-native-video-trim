@@ -37,6 +37,7 @@ android/
   src/main/                   # Shared base classes, UI, utilities
     java/com/videotrim/
       BaseVideoTrimModule.kt  # Core logic: editor, FFmpeg, file ops, VideoTrimListener
+      VideoTrimFileProvider.kt # FileProvider subclass owning our manifest merge key
       VideoTrimPackage.kt     # NativeModule registration
       enums/ErrorCode.java
       interfaces/             # VideoTrimListener, IVideoTrimmerView
@@ -45,7 +46,7 @@ android/
       widgets/AudioWaveformView.kt   # Custom View that renders audio waveform bars (rounded-rect, normalised amplitudes)
       widgets/CropOverlayView.kt     # Freeform crop overlay (brackets, grid, drag/pinch, theme-aware colors)
     java/iknow/android/utils/ # Screen, dp/px, background/UI thread helpers
-    res/                      # Drawables, layout, colors, strings, file_paths.xml
+    res/                      # Drawables, layout, colors, strings, video_trim_file_paths.xml
   src/oldarch/                # Old Architecture module (ReactModule, DeviceEventEmitter)
   src/newarch/                # New Architecture module (TurboModule, codegen emitters)
 
@@ -349,7 +350,7 @@ Caching: Yarn deps, Gradle, CocoaPods, Turborepo outputs.
 - **Old Arch events**: `DeviceEventManagerModule.RCTDeviceEventEmitter.emit(NAME, map)` — single event `"VideoTrim"` with logical name in payload.
 - **New Arch events**: `when(eventName)` dispatch to codegen `emitOn*` methods.
 - **FFmpeg dependency**: `io.github.maitrungduc1410:ffmpeg-kit-<package>:<version>` configurable via `gradle.properties` or consumer's root `ext`/properties.
-- **FileProvider**: Declared in `AndroidManifest.xml` for file sharing/saving.
+- **FileProvider**: Bundled by the library (host apps need no setup) and used by `share()` to hand out `content://` URIs. Everything it contributes to the consumer's merged app is namespaced, and all three parts must stay that way: `android:name` points at our own `VideoTrimFileProvider` subclass because the manifest merger keys `<provider>` by `android:name` and `androidx.core.content.FileProvider` would collide with any other manifest declaring it; the authority is `${applicationId}.videotrimprovider` rather than the docs-default `.provider`; and the paths resource is `video_trim_file_paths.xml` rather than `file_paths.xml`, which a same-named resource elsewhere would silently override. The authority is duplicated in `BaseVideoTrimModule.FILE_PROVIDER_AUTHORITY_SUFFIX` — keep the two in sync. Keep the `<meta-data android:name="android.support.FILE_PROVIDER_PATHS">` child too: the static `getUriForFile` re-reads the paths XML through `PackageManager`, so the `FileProvider(@XmlRes int)` constructor is not a substitute for it.
 - **Min SDK**: 24, Target: 34, Compile: 35.
 - **Theming**: `VideoTrimmerView` reads the `theme` prop and calls `applyThemeColors()` to set background/text/icon colors and crop overlay bracket/grid colors. Light theme uses white background, black icons/text, and black crop brackets/grid.
 - **Background handling**: `BaseVideoTrimModule` implements `LifecycleEventListener`; `onHostPause` pauses the media player. `onSurfaceTextureDestroyed` returns `false` to keep the SurfaceTexture alive, preserving the video frame across backgrounding.
