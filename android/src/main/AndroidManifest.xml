@@ -1,19 +1,30 @@
-<manifest
-  xmlns:android="http://schemas.android.com/apk/res/android"
-  package="com.videotrim">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
 <uses-permission android:name="android.permission.VIBRATE" />
 
   <application>
-    <!-- FileProvider setup -->
+    <!--
+      FileProvider backing share(). Every name here has to be unique across the
+      whole merged app, so all three are namespaced:
+
+      - android:name is our own subclass — the merger keys <provider> by it, so
+        androidx.core.content.FileProvider would collide with any other manifest
+        declaring it and fail the consumer's build.
+      - the authority suffix is .videotrimprovider, not the docs-default
+        .provider that half the ecosystem already uses.
+      - the paths resource is video_trim_file_paths, not file_paths, which a
+        same-named resource elsewhere would silently override.
+
+      KEEP IN SYNC with FILE_PROVIDER_AUTHORITY_SUFFIX in BaseVideoTrimModule.
+    -->
     <provider
-      android:name="androidx.core.content.FileProvider"
-      android:authorities="${applicationId}.provider"
+      android:name="com.videotrim.VideoTrimFileProvider"
+      android:authorities="${applicationId}.videotrimprovider"
       android:exported="false"
       android:grantUriPermissions="true">
       <meta-data
         android:name="android.support.FILE_PROVIDER_PATHS"
-        android:resource="@xml/file_paths" />
+        android:resource="@xml/video_trim_file_paths" />
     </provider>
   </application>
 </manifest>

@@ -1572,7 +1572,11 @@ open class BaseVideoTrimModule internal constructor(
   }
 
   private fun shareFile(context: Context, file: File) {
-    val fileUri = FileProvider.getUriForFile(context, context.packageName + ".provider", file)
+    val fileUri = FileProvider.getUriForFile(
+      context,
+      context.packageName + FILE_PROVIDER_AUTHORITY_SUFFIX,
+      file
+    )
 
     val shareIntent = Intent(Intent.ACTION_SEND)
     shareIntent.type = "*/*"
@@ -1651,7 +1655,11 @@ open class BaseVideoTrimModule internal constructor(
     }
 
     val context: Context = reactApplicationContext
-    val fileUri = FileProvider.getUriForFile(context, context.packageName + ".provider", file)
+    val fileUri = FileProvider.getUriForFile(
+      context,
+      context.packageName + FILE_PROVIDER_AUTHORITY_SUFFIX,
+      file
+    )
 
     val shareIntent = Intent(Intent.ACTION_SEND)
     shareIntent.type = "*/*"
@@ -1679,5 +1687,9 @@ open class BaseVideoTrimModule internal constructor(
     const val TAG = "VideoTrimModule"
     const val REQUEST_CODE_SAVE_FILE = 1
     const val REQUEST_CODE_SAVE_TO_DOCUMENTS = 2
+
+    // KEEP IN SYNC with android:authorities in AndroidManifest.xml. getUriForFile
+    // resolves the provider by authority alone, so a mismatch fails at runtime.
+    const val FILE_PROVIDER_AUTHORITY_SUFFIX = ".videotrimprovider"
   }
 }
