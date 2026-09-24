@@ -109,17 +109,25 @@ class VideoTrimmerViewController: UIViewController {
     private var cropOverlayView: CropOverlayView?
     private(set) var isCropActive = false
     
-    private struct TransformSnapshot: Equatable {
+    /// One undo/redo step: everything the user can change in the editor.
+    private struct EditSnapshot: Equatable {
         let rotationCount: Int
         let isFlipped: Bool
         let isCropActive: Bool
         let cropNormalized: CGRect?
+        let startMs: Double
+        let endMs: Double
+        let isMuted: Bool
+        let speed: Double
     }
-    private var undoStack: [TransformSnapshot] = []
-    private var redoStack: [TransformSnapshot] = []
+    private var undoStack: [EditSnapshot] = []
+    private var redoStack: [EditSnapshot] = []
     private var undoBtn: UIButton?
     private var redoBtn: UIButton?
-    private var preCropSnapshot: TransformSnapshot?
+    // State before an in-progress gesture (crop drag, trim-handle drag, range drag); committed
+    // as one undo step when the gesture ends, if it changed anything.
+    private var preCropSnapshot: EditSnapshot?
+    private var preTrimSnapshot: EditSnapshot?
     // Session to restore from `EditorConfig.editState`: mute/speed apply in configure, the
     // trim range once the trimmer has its asset, transforms once the player is ready and
     // laid out. Cleared after it has been applied.
@@ -158,6 +166,7 @@ class VideoTrimmerViewController: UIViewController {
     
     // MARK: - Input
     @objc private func didBeginTrimmingFromStart(_ sender: VideoTrimmer) {
+        preTrimSnapshot = currentSnapshot()
         handleBeforeProgressChange()
     }
     
@@ -167,9 +176,12 @@ class VideoTrimmerViewController: UIViewController {
     
     @objc private func didEndTrimmingFromStart(_ sender: VideoTrimmer) {
         handleTrimmingEnd(true)
+        commitUndo(from: preTrimSnapshot)
+        preTrimSnapshot = nil
     }
     
     @objc private func didBeginTrimmingFromEnd(_ sender: VideoTrimmer) {
+        preTrimSnapshot = currentSnapshot()
         handleBeforeProgressChange()
     }
     
@@ -179,9 +191,12 @@ class VideoTrimmerViewController: UIViewController {
     
     @objc private func didEndTrimmingFromEnd(_ sender: VideoTrimmer) {
         handleTrimmingEnd(false)
+        commitUndo(from: preTrimSnapshot)
+        preTrimSnapshot = nil
     }
     
     @objc private func didBeginDraggingRange(_ sender: VideoTrimmer) {
+        preTrimSnapshot = currentSnapshot()
         handleBeforeProgressChange()
     }
     
@@ -193,6 +208,8 @@ class VideoTrimmerViewController: UIViewController {
         self.trimmer.progress = trimmer.selectedRange.start
         updateLabels()
         seek(to: trimmer.progress)
+        commitUndo(from: preTrimSnapshot)
+        preTrimSnapshot = nil
     }
     
     @objc private func didBeginScrubbing(_ sender: VideoTrimmer) {
@@ -613,7 +630,9 @@ class VideoTrimmerViewController: UIViewController {
         
         if enableDeleteButton {
             let deleteButton = UIButton(type: .system)
-            deleteButton.setImage(UIImage(systemName: "trash", withConfiguration: symbolConfig), for: .normal)
+            // The trash glyph is denser than its neighbours at the same point size; one step
+            // down keeps it visually in line with them (14×16 vs e.g. undo's 17×16).
+            deleteButton.setImage(UIImage(systemName: "trash", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .medium)), for: .normal)
             deleteButton.tintColor = iconColor
             deleteButton.accessibilityLabel = "Delete"
             deleteButton.addTarget(self, action: #selector(onDeleteTapped), for: .touchUpInside)
@@ -662,9 +681,8 @@ class VideoTrimmerViewController: UIViewController {
     }
     
     @objc private func onMuteTapped() {
-        isMuted.toggle()
-        muteBtn?.setImage(UIImage(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", withConfiguration: symbolConfig), for: .normal)
-        player.isMuted = isMuted
+        pushUndo()
+        applyMuted(!isMuted)
         if enableHapticFeedback {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
@@ -747,17 +765,9 @@ class VideoTrimmerViewController: UIViewController {
     }
     
     private func setSpeed(_ newSpeed: Double) {
-        speed = newSpeed
-        speedBtn?.setTitle(Self.speedLabel(newSpeed), for: .normal)
-        if #available(iOS 14.0, *) {
-            speedBtn?.menu = buildSpeedMenu()
-        }
-        // A non-zero rate starts playback, so only apply it live while playing; togglePlay
-        // applies `speed` on the next play. (Setting it and pausing again when "not .playing"
-        // also paused a player that was merely buffering.)
-        if player.rate != 0 {
-            player.rate = Float(newSpeed)
-        }
+        guard abs(newSpeed - speed) > 0.0001 else { return }
+        pushUndo()
+        applySpeed(newSpeed)
         if enableHapticFeedback {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
@@ -853,17 +863,29 @@ class VideoTrimmerViewController: UIViewController {
     
     // MARK: - Undo / Redo
     
-    private func currentSnapshot() -> TransformSnapshot {
-        TransformSnapshot(
+    private func currentSnapshot() -> EditSnapshot {
+        EditSnapshot(
             rotationCount: rotationCount,
             isFlipped: isFlipped,
             isCropActive: isCropActive,
-            cropNormalized: cropNormalizedRect
+            cropNormalized: cropNormalizedRect,
+            startMs: (trimmer.selectedRange.start.seconds * 1000).rounded(),
+            endMs: (trimmer.selectedRange.end.seconds * 1000).rounded(),
+            isMuted: isMuted,
+            speed: speed
         )
     }
     
     private func pushUndo() {
         undoStack.append(currentSnapshot())
+        redoStack.removeAll()
+        updateUndoRedoButtons()
+    }
+    
+    /// Records `before` as one undo step if the gesture that started there changed anything.
+    private func commitUndo(from before: EditSnapshot?) {
+        guard let before = before, before != currentSnapshot() else { return }
+        undoStack.append(before)
         redoStack.removeAll()
         updateUndoRedoButtons()
     }
@@ -882,7 +904,11 @@ class VideoTrimmerViewController: UIViewController {
         updateUndoRedoButtons()
     }
     
-    private func applySnapshot(_ snap: TransformSnapshot, animated: Bool = true) {
+    private func applySnapshot(_ snap: EditSnapshot, animated: Bool = true) {
+        applyTrimRange(startMs: snap.startMs, endMs: snap.endMs)
+        applyMuted(snap.isMuted)
+        applySpeed(snap.speed)
+        
         rotationCount = snap.rotationCount
         isFlipped = snap.isFlipped
         
@@ -920,6 +946,44 @@ class VideoTrimmerViewController: UIViewController {
         }
     }
     
+    /// Selects a trim range, keeping the playhead inside it; skipped if it doesn't fit this asset.
+    private func applyTrimRange(startMs: Double, endMs: Double) {
+        guard let duration = asset?.duration else { return }
+        let start = CMTime(value: CMTimeValue(startMs.rounded()), timescale: 1000)
+        let end = CMTimeMinimum(CMTime(value: CMTimeValue(endMs.rounded()), timescale: 1000), duration)
+        guard start >= .zero, end > start else { return }
+        let length = CMTimeSubtract(end, start)
+        guard length >= trimmer.minimumDuration, length <= trimmer.maximumDuration else { return }
+        let range = CMTimeRange(start: start, end: end)
+        guard !CMTimeRangeEqual(range, trimmer.selectedRange) else { return }
+        trimmer.selectedRange = range
+        if !CMTimeRangeContainsTime(range, time: trimmer.progress) {
+            trimmer.progress = start
+            seek(to: start)
+        }
+        updateLabels()
+    }
+    
+    private func applyMuted(_ muted: Bool) {
+        isMuted = muted
+        muteBtn?.setImage(UIImage(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill", withConfiguration: symbolConfig), for: .normal)
+        player?.isMuted = muted
+    }
+    
+    private func applySpeed(_ newSpeed: Double) {
+        speed = newSpeed
+        speedBtn?.setTitle(Self.speedLabel(newSpeed), for: .normal)
+        if #available(iOS 14.0, *) {
+            speedBtn?.menu = buildSpeedMenu()
+        }
+        // A non-zero rate starts playback, so only apply it live while playing; togglePlay
+        // applies `speed` on the next play. (Setting it and pausing again when "not .playing"
+        // also paused a player that was merely buffering.)
+        if let player = player, player.rate != 0 {
+            player.rate = Float(newSpeed)
+        }
+    }
+    
     private func setCropFromNormalized(_ norm: CGRect) {
         let vr = getVideoDisplayRectInContainer()
         guard vr.width > 1, vr.height > 1 else { return }
@@ -954,18 +1018,52 @@ class VideoTrimmerViewController: UIViewController {
     }
 
     /// Applies the saved rotation / flip / crop without animation, so the editor opens already
-    /// showing them. Undo history starts empty: the restored state is the new baseline.
+    /// showing them, and brings back the session's undo/redo history.
     private func restoreTransforms(_ state: TrimEditState) {
         guard isVideoType else { return }
         let crop = state.crop.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h) }
         // Transform and crop maths read the player/container bounds.
         view.layoutIfNeeded()
-        applySnapshot(TransformSnapshot(
+        let current = currentSnapshot() // trim range, mute and speed are already restored
+        applySnapshot(EditSnapshot(
             rotationCount: state.rotation,
             isFlipped: state.flipped,
             isCropActive: crop != nil,
-            cropNormalized: crop
+            cropNormalized: crop,
+            startMs: current.startMs,
+            endMs: current.endMs,
+            isMuted: current.isMuted,
+            speed: current.speed
         ), animated: false)
+        undoStack = (state.undo ?? []).map(Self.snapshot(from:))
+        redoStack = (state.redo ?? []).map(Self.snapshot(from:))
+        updateUndoRedoButtons()
+    }
+    
+    private static func snapshot(from step: TrimEditState.Step) -> EditSnapshot {
+        EditSnapshot(
+            rotationCount: step.rotation,
+            isFlipped: step.flipped,
+            isCropActive: step.cropActive,
+            cropNormalized: step.crop.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h) },
+            startMs: step.startMs,
+            endMs: step.endMs,
+            isMuted: step.muted,
+            speed: step.speed
+        )
+    }
+    
+    private static func step(from snap: EditSnapshot) -> TrimEditState.Step {
+        TrimEditState.Step(
+            startMs: snap.startMs,
+            endMs: snap.endMs,
+            rotation: snap.rotationCount,
+            flipped: snap.isFlipped,
+            cropActive: snap.isCropActive,
+            crop: snap.cropNormalized.map { TrimEditState.Crop(x: Double($0.minX), y: Double($0.minY), w: Double($0.width), h: Double($0.height)) },
+            muted: snap.isMuted,
+            speed: snap.speed
+        )
     }
 
     /// The current session as an `editState` string for `onFinishTrimming`.
@@ -981,7 +1079,9 @@ class VideoTrimmerViewController: UIViewController {
             flipped: isFlipped,
             crop: crop,
             muted: isMuted,
-            speed: speed
+            speed: speed,
+            undo: undoStack.suffix(TrimEditState.maxHistory).map(Self.step(from:)),
+            redo: redoStack.suffix(TrimEditState.maxHistory).map(Self.step(from:))
         ).encoded()
     }
     
@@ -1046,12 +1146,8 @@ class VideoTrimmerViewController: UIViewController {
             self?.preCropSnapshot = self?.currentSnapshot()
         }
         overlay.onCropEnded = { [weak self] in
-            guard let self = self, let snap = self.preCropSnapshot else { return }
-            if self.currentSnapshot() != snap {
-                self.undoStack.append(snap)
-                self.redoStack.removeAll()
-                self.updateUndoRedoButtons()
-            }
+            guard let self = self else { return }
+            self.commitUndo(from: self.preCropSnapshot)
             self.preCropSnapshot = nil
         }
     }
@@ -1342,11 +1438,35 @@ private extension UILabel {
 struct TrimEditState: Codable {
     static let currentVersion = 1
     
+    /// Undo/redo history is capped when saved; older steps are dropped.
+    static let maxHistory = 50
+    
     struct Crop: Codable {
         let x: Double
         let y: Double
         let w: Double
         let h: Double
+        
+        var isValid: Bool {
+            let eps = 0.001
+            return x >= 0 && y >= 0 && w > 0 && h > 0 && x + w <= 1 + eps && y + h <= 1 + eps
+        }
+    }
+    
+    /// One undo/redo step. `cropActive` with a nil `crop` = crop tool open on the full frame.
+    struct Step: Codable {
+        let startMs: Double
+        let endMs: Double
+        let rotation: Int
+        let flipped: Bool
+        let cropActive: Bool
+        var crop: Crop?
+        let muted: Bool
+        let speed: Double
+        
+        var isValid: Bool {
+            startMs >= 0 && endMs > startMs && (0..<4).contains(rotation) && (0.25...4.0).contains(speed)
+        }
     }
     
     let v: Int
@@ -1357,6 +1477,9 @@ struct TrimEditState: Codable {
     var crop: Crop?
     let muted: Bool
     let speed: Double
+    // Absent in states saved before history was kept.
+    var undo: [Step]?
+    var redo: [Step]?
     
     /// Nil for malformed, out-of-range or newer-version input, so a bad value degrades to
     /// "open fresh" rather than a broken editor. An invalid crop alone is dropped.
@@ -1367,13 +1490,19 @@ struct TrimEditState: Codable {
               state.startMs >= 0, state.endMs > state.startMs,
               (0..<4).contains(state.rotation),
               (0.25...4.0).contains(state.speed) else { return nil }
-        if let c = state.crop {
-            let eps = 0.001
-            let valid = c.x >= 0 && c.y >= 0 && c.w > 0 && c.h > 0 && c.x + c.w <= 1 + eps && c.y + c.h <= 1 + eps
-            if !valid {
-                state.crop = nil
+        if let c = state.crop, !c.isValid {
+            state.crop = nil
+        }
+        // History is best-effort: drop steps that don't make sense rather than the whole state.
+        let clean: ([Step]?) -> [Step] = { steps in
+            (steps ?? []).filter(\.isValid).suffix(maxHistory).map { step in
+                var step = step
+                if let c = step.crop, !c.isValid { step.crop = nil }
+                return step
             }
         }
+        state.undo = clean(state.undo)
+        state.redo = clean(state.redo)
         return state
     }
     

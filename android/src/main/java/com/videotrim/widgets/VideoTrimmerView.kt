@@ -190,16 +190,24 @@ class VideoTrimmerView(
   private var isCropActive = false
   private var cumulativeRotationDeg = 0f
 
-  private data class TransformSnapshot(
+  /** One undo/redo step: everything the user can change in the editor. */
+  private data class EditSnapshot(
     val rotationCount: Int,
     val isFlipped: Boolean,
     val isCropActive: Boolean,
     val cropNormalized: RectF?,
-    val cumulativeRotationDeg: Float
+    val cumulativeRotationDeg: Float,
+    val startTime: Long,
+    val endTime: Long,
+    val isMuted: Boolean,
+    val speed: Double
   )
-  private val undoStack = mutableListOf<TransformSnapshot>()
-  private val redoStack = mutableListOf<TransformSnapshot>()
-  private var preCropSnapshot: TransformSnapshot? = null
+  private val undoStack = mutableListOf<EditSnapshot>()
+  private val redoStack = mutableListOf<EditSnapshot>()
+  // State before an in-progress gesture (crop drag, trim-handle drag, range drag); committed as
+  // one undo step when the gesture ends, if it changed anything.
+  private var preCropSnapshot: EditSnapshot? = null
+  private var preTrimSnapshot: EditSnapshot? = null
 
   // Session to restore from `EditorConfig.editState`: mute/speed apply in configure, the trim
   // range and transforms once the media is prepared. Cleared after it has been applied.
@@ -672,9 +680,8 @@ class VideoTrimmerView(
   }
 
   private fun onMuteTapped() {
-    isMuted = !isMuted
-    muteBtn.setImageResource(if (isMuted) R.drawable.speaker_slash_fill else R.drawable.speaker_wave_2_fill)
-    mediaPlayer?.setVolume(if (isMuted) 0f else 1f, if (isMuted) 0f else 1f)
+    pushUndo()
+    applyMuted(!isMuted)
     if (enableHapticFeedback) {
       performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
     }
@@ -739,16 +746,9 @@ class VideoTrimmerView(
   }
 
   private fun setSpeed(newSpeed: Double) {
-    speed = newSpeed
-    speedBtn.text = speedLabel(newSpeed)
-    // Only apply playbackParams when actively playing. Calling setPlaybackParams() on a
-    // prepared-but-paused MediaPlayer implicitly starts playback (Android docs), which
-    // would silently resume the video when the user just wanted to pick a future speed.
-    // When paused, the new speed is picked up by playOrPause() on the next play.
-    val player = mediaPlayer
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && player != null && player.isPlaying) {
-      player.playbackParams = player.playbackParams.setSpeed(newSpeed.toFloat())
-    }
+    if (kotlin.math.abs(newSpeed - speed) < 0.0001) return
+    pushUndo()
+    applySpeed(newSpeed)
     if (enableHapticFeedback) {
       performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
     }
@@ -1179,6 +1179,7 @@ class VideoTrimmerView(
 
       when (event.action) {
         MotionEvent.ACTION_DOWN -> {
+          preTrimSnapshot = currentSnapshot()
           isRangeDragging = false
           didClampWhilePanning = false
           onMediaPause()
@@ -1198,6 +1199,8 @@ class VideoTrimmerView(
             fadeInProgressIndicator()
             updateCurrentTime(true)
           }
+          commitUndo(preTrimSnapshot)
+          preTrimSnapshot = null
           view.performClick()
         }
         else -> return@setOnTouchListener false
@@ -1289,6 +1292,7 @@ class VideoTrimmerView(
       val draggingDisabled = mDuration < mMinDuration
       when (event.action) {
         MotionEvent.ACTION_DOWN -> {
+          preTrimSnapshot = currentSnapshot()
           currentSelectedhandle = handle
           didClampWhilePanning = false
           onMediaPause()
@@ -1419,6 +1423,8 @@ class VideoTrimmerView(
         MotionEvent.ACTION_UP -> {
           stopZoomIfNeeded()
           fadeInProgressIndicator()
+          commitUndo(preTrimSnapshot)
+          preTrimSnapshot = null
           view.performClick()
         }
         else -> return@setOnTouchListener false
@@ -2261,13 +2267,8 @@ class VideoTrimmerView(
     overlay.alpha = 0f
     overlay.onCropBegan = { preCropSnapshot = currentSnapshot() }
     overlay.onCropEnded = {
-      val before = preCropSnapshot
+      commitUndo(preCropSnapshot)
       preCropSnapshot = null
-      if (before != null && before != currentSnapshot()) {
-        undoStack.add(before)
-        redoStack.clear()
-        updateUndoRedoButtons()
-      }
     }
     videoContainer.addView(overlay)
     cropOverlay = overlay
@@ -2296,13 +2297,8 @@ class VideoTrimmerView(
     )
     overlay.onCropBegan = { preCropSnapshot = currentSnapshot() }
     overlay.onCropEnded = {
-      val before = preCropSnapshot
+      commitUndo(preCropSnapshot)
       preCropSnapshot = null
-      if (before != null && before != currentSnapshot()) {
-        undoStack.add(before)
-        redoStack.clear()
-        updateUndoRedoButtons()
-      }
     }
     videoContainer.addView(overlay)
     cropOverlay = overlay
@@ -2399,13 +2395,17 @@ class VideoTrimmerView(
 
   // region Undo / Redo
 
-  private fun currentSnapshot(): TransformSnapshot {
-    return TransformSnapshot(
+  private fun currentSnapshot(): EditSnapshot {
+    return EditSnapshot(
       rotationCount = rotationCount,
       isFlipped = isFlipped,
       isCropActive = isCropActive,
       cropNormalized = getCropNormalizedRect(),
-      cumulativeRotationDeg = cumulativeRotationDeg
+      cumulativeRotationDeg = cumulativeRotationDeg,
+      startTime = startTime,
+      endTime = endTime,
+      isMuted = isMuted,
+      speed = speed
     )
   }
 
@@ -2413,6 +2413,46 @@ class VideoTrimmerView(
     undoStack.add(currentSnapshot())
     redoStack.clear()
     updateUndoRedoButtons()
+  }
+
+  /** Records [before] as one undo step if the gesture that started there changed anything. */
+  private fun commitUndo(before: EditSnapshot?) {
+    if (before == null || before == currentSnapshot()) return
+    undoStack.add(before)
+    redoStack.clear()
+    updateUndoRedoButtons()
+  }
+
+  /** Selects a trim range, keeping the playhead inside it; skipped if it doesn't fit the media. */
+  private fun applyTrimRange(start: Long, end: Long) {
+    val clampedEnd = minOf(end, mDuration.toLong())
+    if (start < 0 || clampedEnd <= start) return
+    if (clampedEnd - start !in mMinDuration..mMaxDuration) return
+    if (start == startTime && clampedEnd == endTime) return
+    startTime = start
+    endTime = clampedEnd
+    updateHandlePositions()
+    val position = mediaPlayer?.currentPosition?.toLong() ?: return
+    if (position < startTime || position > endTime) seekTo(startTime, true)
+  }
+
+  private fun applyMuted(muted: Boolean) {
+    isMuted = muted
+    muteBtn.setImageResource(if (muted) R.drawable.speaker_slash_fill else R.drawable.speaker_wave_2_fill)
+    mediaPlayer?.setVolume(if (muted) 0f else 1f, if (muted) 0f else 1f)
+  }
+
+  private fun applySpeed(newSpeed: Double) {
+    speed = newSpeed
+    speedBtn.text = speedLabel(newSpeed)
+    // Only apply playbackParams when actively playing. Calling setPlaybackParams() on a
+    // prepared-but-paused MediaPlayer implicitly starts playback (Android docs), which
+    // would silently resume the video when the user just wanted to pick a future speed.
+    // When paused, the new speed is picked up by playOrPause() on the next play.
+    val player = mediaPlayer
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && player != null && player.isPlaying) {
+      player.playbackParams = player.playbackParams.setSpeed(newSpeed.toFloat())
+    }
   }
 
   private fun onUndoTapped() {
@@ -2431,7 +2471,11 @@ class VideoTrimmerView(
     updateUndoRedoButtons()
   }
 
-  private fun applySnapshot(snap: TransformSnapshot, animated: Boolean = true) {
+  private fun applySnapshot(snap: EditSnapshot, animated: Boolean = true) {
+    applyTrimRange(snap.startTime, snap.endTime)
+    applyMuted(snap.isMuted)
+    applySpeed(snap.speed)
+
     val flipChanging = isFlipped != snap.isFlipped
     val prevRotationCount = rotationCount
 
@@ -2543,48 +2587,82 @@ class VideoTrimmerView(
 
   /**
    * Applies the saved rotation / flip / crop without animation, so the editor opens already
-   * showing them. Undo history starts empty: the restored state is the new baseline.
+   * showing them, and brings back the session's undo/redo history.
    */
   private fun restoreTransforms(state: TrimEditState) {
-    val crop = state.crop?.let {
-      RectF(it.x.toFloat(), it.y.toFloat(), (it.x + it.w).toFloat(), (it.y + it.h).toFloat())
-    }
+    val crop = state.crop?.let { cropRect(it) }
+    // Trim range, mute and speed are already restored.
     applySnapshot(
-      TransformSnapshot(
+      currentSnapshot().copy(
         rotationCount = state.rotation,
         isFlipped = state.flipped,
         isCropActive = crop != null,
         cropNormalized = crop,
-        // What the rotate/flip handlers accumulate: -90° per turn, mirrored while flipped.
-        cumulativeRotationDeg = if (state.flipped) state.rotation * 90f else -state.rotation * 90f
+        cumulativeRotationDeg = cumulativeRotationFor(state.rotation, state.flipped)
       ),
       animated = false
     )
+    undoStack.clear()
+    undoStack.addAll(state.undo.map { snapshotFrom(it) })
+    redoStack.clear()
+    redoStack.addAll(state.redo.map { snapshotFrom(it) })
+    updateUndoRedoButtons()
   }
 
-  private fun serializeEditState(): String {
-    // getCropNormalizedRect() isn't clamped; float error can push an edge just past 0 or 1.
-    val crop = getCropNormalizedRect()?.let {
-      val x = it.left.coerceIn(0f, 1f)
-      val y = it.top.coerceIn(0f, 1f)
-      TrimEditState.Crop(
-        x.toDouble(),
-        y.toDouble(),
-        (it.right.coerceAtMost(1f) - x).toDouble(),
-        (it.bottom.coerceAtMost(1f) - y).toDouble()
-      )
-    }
-    return TrimEditState(
-      v = TrimEditState.CURRENT_VERSION,
-      startMs = startTime,
-      endMs = endTime,
-      rotation = rotationCount,
-      flipped = isFlipped,
-      crop = crop,
-      muted = isMuted,
-      speed = speed
-    ).toJson()
+  // What the rotate/flip handlers accumulate: -90° per turn, mirrored while flipped.
+  private fun cumulativeRotationFor(rotation: Int, flipped: Boolean): Float =
+    if (flipped) rotation * 90f else -rotation * 90f
+
+  private fun cropRect(c: TrimEditState.Crop): RectF =
+    RectF(c.x.toFloat(), c.y.toFloat(), (c.x + c.w).toFloat(), (c.y + c.h).toFloat())
+
+  // getCropNormalizedRect() isn't clamped; float error can push an edge just past 0 or 1.
+  private fun cropOf(rect: RectF?): TrimEditState.Crop? = rect?.let {
+    val x = it.left.coerceIn(0f, 1f)
+    val y = it.top.coerceIn(0f, 1f)
+    TrimEditState.Crop(
+      x.toDouble(),
+      y.toDouble(),
+      (it.right.coerceAtMost(1f) - x).toDouble(),
+      (it.bottom.coerceAtMost(1f) - y).toDouble()
+    )
   }
+
+  private fun snapshotFrom(step: TrimEditState.Step): EditSnapshot = EditSnapshot(
+    rotationCount = step.rotation,
+    isFlipped = step.flipped,
+    isCropActive = step.cropActive,
+    cropNormalized = step.crop?.let { cropRect(it) },
+    cumulativeRotationDeg = cumulativeRotationFor(step.rotation, step.flipped),
+    startTime = step.startMs,
+    endTime = step.endMs,
+    isMuted = step.muted,
+    speed = step.speed
+  )
+
+  private fun stepFrom(snap: EditSnapshot): TrimEditState.Step = TrimEditState.Step(
+    startMs = snap.startTime,
+    endMs = snap.endTime,
+    rotation = snap.rotationCount,
+    flipped = snap.isFlipped,
+    cropActive = snap.isCropActive,
+    crop = cropOf(snap.cropNormalized),
+    muted = snap.isMuted,
+    speed = snap.speed
+  )
+
+  private fun serializeEditState(): String = TrimEditState(
+    v = TrimEditState.CURRENT_VERSION,
+    startMs = startTime,
+    endMs = endTime,
+    rotation = rotationCount,
+    flipped = isFlipped,
+    crop = cropOf(getCropNormalizedRect()),
+    muted = isMuted,
+    speed = speed,
+    undo = undoStack.takeLast(TrimEditState.MAX_HISTORY).map { stepFrom(it) },
+    redo = redoStack.takeLast(TrimEditState.MAX_HISTORY).map { stepFrom(it) }
+  ).toJson()
 
   // endregion
 

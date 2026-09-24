@@ -99,9 +99,9 @@ export interface EditorConfig extends BaseOptions {
   /**
    * Restore a previous editing session: the `editState` string from an earlier
    * `onFinishTrimming` event for the same source file. The editor opens with that
-   * trim range, rotation, flip, crop, mute and speed already applied (undo history
-   * starts fresh). Mute and speed here override `removeAudio` / `speed` for the
-   * editor UI. Treat the string as opaque — its JSON shape is versioned internally
+   * trim range, rotation, flip, crop, mute and speed already applied, and with the
+   * session's undo/redo history (which covers all of those). Mute and speed here
+   * override `removeAudio` / `speed` for the editor UI. Treat the string as opaque — its JSON shape is versioned internally
    * and unknown or malformed values are ignored.
    */
   editState?: string;
@@ -608,7 +608,7 @@ export interface Spec extends TurboModule {
     duration: number;
     /**
      * Opaque snapshot of the editor settings that produced this output (trim range,
-     * rotation, flip, crop, mute, speed). Persist it and pass it back as
+     * rotation, flip, crop, mute, speed) plus the undo/redo history. Persist it and pass it back as
      * `EditorConfig.editState` with the same source file to reopen the editor where
      * the user left off.
      */
