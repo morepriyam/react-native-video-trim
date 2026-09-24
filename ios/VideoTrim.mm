@@ -148,7 +148,22 @@ RCT_EXPORT_MODULE()
   dict[@"enablePreciseTrimming"] = @(config.enablePreciseTrimming());
   dict[@"removeAudio"] = @(config.removeAudio());
   dict[@"speed"] = @(config.speed());
-  
+  dict[@"enableDeleteButton"] = @(config.enableDeleteButton());
+  dict[@"enableDeleteDialog"] = @(config.enableDeleteDialog());
+  dict[@"deleteDialogTitle"] = config.deleteDialogTitle();
+  dict[@"deleteDialogMessage"] = config.deleteDialogMessage();
+  dict[@"deleteDialogCancelText"] = config.deleteDialogCancelText();
+  dict[@"deleteDialogConfirmText"] = config.deleteDialogConfirmText();
+
+  auto speedOptionsOpt = config.speedOptions();
+  if (speedOptionsOpt.has_value()) {
+    NSMutableArray *speedOptions = [NSMutableArray array];
+    for (double option : speedOptionsOpt.value()) {
+      [speedOptions addObject:@(option)];
+    }
+    dict[@"speedOptions"] = speedOptions;
+  }
+
   // Handle optional color values
   auto trimmerColorOpt = config.trimmerColor();
   if (trimmerColorOpt.has_value()) {
@@ -200,6 +215,11 @@ RCT_EXPORT_MODULE()
     dict[@"durationFormat"] = durationFormat;
   }
   
+  NSString *editState = config.editState();
+  if (editState != nil) {
+    dict[@"editState"] = editState;
+  }
+
   [self->videoTrim showEditor:filePath withConfig:dict];
 }
 
@@ -397,6 +417,8 @@ RCT_EXPORT_MODULE()
     [self emitOnCancelTrimming];
   } else if ([eventName isEqualToString:@"onCancel"]) {
     [self emitOnCancel];
+  } else if ([eventName isEqualToString:@"onDelete"]) {
+    [self emitOnDelete];
   } else if ([eventName isEqualToString:@"onHide"]) {
     [self emitOnHide];
   } else if ([eventName isEqualToString:@"onShow"]) {

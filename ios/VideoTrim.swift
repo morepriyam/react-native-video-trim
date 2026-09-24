@@ -98,6 +98,33 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
       return editorConfig?["cancelDialogConfirmText"] as! String
     }
   }
+  // Delete-button options are newer than the rest of the config, so read them leniently
+  // (an old-arch host that doesn't send them gets the defaults instead of a crash).
+  private var enableDeleteDialog: Bool {
+    get {
+      return editorConfig?["enableDeleteDialog"] as? Bool ?? true
+    }
+  }
+  private var deleteDialogTitle: String {
+    get {
+      return editorConfig?["deleteDialogTitle"] as? String ?? "Delete?"
+    }
+  }
+  private var deleteDialogMessage: String {
+    get {
+      return editorConfig?["deleteDialogMessage"] as? String ?? "This cannot be undone."
+    }
+  }
+  private var deleteDialogCancelText: String {
+    get {
+      return editorConfig?["deleteDialogCancelText"] as? String ?? "Cancel"
+    }
+  }
+  private var deleteDialogConfirmText: String {
+    get {
+      return editorConfig?["deleteDialogConfirmText"] as? String ?? "Delete"
+    }
+  }
   private var enableSaveDialog: Bool {
     get {
       return editorConfig?["enableSaveDialog"] as! Bool
@@ -383,6 +410,10 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     
     emitEventToJS("onStartTrimming", eventData: nil)
     
+    // Snapshot the session now, while the editor still shows exactly what is being exported;
+    // it rides along on onFinishTrimming so the host can reopen the editor from it.
+    let editState = viewController.editStateJSON(startMs: (startTime * 1000).rounded(), endMs: (endTime * 1000).rounded())
+    
     var ffmpegSession: FFmpegSession?
     let progressAlert = ProgressAlertController()
     progressAlert.modalPresentationStyle = .overFullScreen
@@ -606,7 +637,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         let returnCode = session?.getReturnCode()
 
         if ReturnCode.isSuccess(returnCode) {
-          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, progressAlert: progressAlert)
+          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, editState: editState, progressAlert: progressAlert)
           return
         }
 
@@ -680,7 +711,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     if passthroughEligible {
       VideoTrim.passthroughTrim(input: inputFile, startSec: startTime, endSec: endTime, stripAudio: stripAudio, outputFile: outputFile, fileType: passthroughFileType!) { ok in
         if ok {
-          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, progressAlert: progressAlert)
+          self.handleEditorTrimSuccess(outputFile: outputFile, startTime: startTime, endTime: endTime, videoDuration: videoDuration, isVideoType: isVideoType, editState: editState, progressAlert: progressAlert)
         } else {
           NSLog("[trim] passthrough failed, falling back to FFmpeg")
           runLegacy()
@@ -694,8 +725,11 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
   // Success flow shared by the passthrough and FFmpeg trim paths: emit onFinishTrimming,
   // honor saveToPhoto / openDocuments / share, then dismiss the progress alert (closing the
   // editor when configured).
-  private func handleEditorTrimSuccess(outputFile: URL, startTime: Double, endTime: Double, videoDuration: Double, isVideoType: Bool, progressAlert: ProgressAlertController) {
-    let eventPayload: [String: Any] = ["outputPath": outputFile.absoluteString, "startTime": (startTime * 1000).rounded(), "endTime": (endTime * 1000).rounded(), "duration": (videoDuration * 1000).rounded()]
+  private func handleEditorTrimSuccess(outputFile: URL, startTime: Double, endTime: Double, videoDuration: Double, isVideoType: Bool, editState: String?, progressAlert: ProgressAlertController) {
+    var eventPayload: [String: Any] = ["outputPath": outputFile.absoluteString, "startTime": (startTime * 1000).rounded(), "endTime": (endTime * 1000).rounded(), "duration": (videoDuration * 1000).rounded()]
+    if let editState = editState {
+      eventPayload["editState"] = editState
+    }
     emitEventToJS("onFinishTrimming", eventData: eventPayload)
 
     if (saveToPhoto && isVideoType) {
@@ -1155,6 +1189,25 @@ extension VideoTrim {
         dialogMessage.addAction(cancel)
         
         // Present alert message to user
+        if let root = RCTPresentedViewController() {
+          root.present(dialogMessage, animated: true, completion: nil)
+        }
+      }
+      
+      vc.deleteBtnClicked = {
+        let delete = {
+          self.emitEventToJS("onDelete", eventData: nil)
+          self.closeEditor()
+        }
+        if !self.enableDeleteDialog {
+          delete()
+          return
+        }
+        
+        let dialogMessage = UIAlertController(title: self.deleteDialogTitle, message: self.deleteDialogMessage, preferredStyle: .alert)
+        dialogMessage.overrideUserInterfaceStyle = self.isLightTheme ? .light : .dark
+        dialogMessage.addAction(UIAlertAction(title: self.deleteDialogCancelText, style: .cancel))
+        dialogMessage.addAction(UIAlertAction(title: self.deleteDialogConfirmText, style: .destructive) { _ in delete() })
         if let root = RCTPresentedViewController() {
           root.present(dialogMessage, animated: true, completion: nil)
         }

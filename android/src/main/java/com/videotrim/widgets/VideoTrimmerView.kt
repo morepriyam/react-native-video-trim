@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.text.InputType
 import android.util.AttributeSet
 import android.util.Log
 import android.util.TypedValue
@@ -30,6 +31,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.view.animation.DecelerateInterpolator
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -48,6 +50,7 @@ import com.videotrim.interfaces.IVideoTrimmerView
 import com.videotrim.interfaces.VideoTrimListener
 import com.videotrim.utils.MediaMetadataUtil
 import com.videotrim.utils.StorageUtil
+import com.videotrim.utils.TrimEditState
 import com.videotrim.utils.VideoTrimmerUtil
 import com.videotrim.utils.VideoTrimmerUtil.RECYCLER_VIEW_PADDING
 import com.videotrim.utils.VideoTrimmerUtil.VIDEO_FRAMES_WIDTH
@@ -59,6 +62,7 @@ import iknow.android.utils.thread.UiThreadExecutor
 import java.io.IOException
 import java.util.Locale
 import androidx.core.graphics.toColorInt
+import androidx.core.view.doOnLayout
 
 class VideoTrimmerView(
   context: ReactApplicationContext,
@@ -197,6 +201,13 @@ class VideoTrimmerView(
   private val redoStack = mutableListOf<TransformSnapshot>()
   private var preCropSnapshot: TransformSnapshot? = null
 
+  // Session to restore from `EditorConfig.editState`: mute/speed apply in configure, the trim
+  // range and transforms once the media is prepared. Cleared after it has been applied.
+  private var restoredEditState: TrimEditState? = null
+  // The session being exported by the current save, for onFinishTrimming's `editState`.
+  var savedEditState: String? = null
+    private set
+
   private lateinit var transformRow: LinearLayout
   private lateinit var flipBtn: ImageView
   private lateinit var rotateBtn: ImageView
@@ -205,6 +216,8 @@ class VideoTrimmerView(
   private lateinit var redoBtn: ImageView
   private lateinit var muteBtn: ImageView
   private lateinit var speedBtn: TextView
+  private lateinit var deleteBtn: ImageView
+  private var enableDeleteButton = false
   private lateinit var videoContainer: FrameLayout
   private var cropOverlay: CropOverlayView? = null
 
@@ -212,7 +225,7 @@ class VideoTrimmerView(
     private set
   private var configRemoveAudio = false
   private var speed: Double = 1.0
-  private val speedOptions = doubleArrayOf(0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
+  private var speedOptions = doubleArrayOf(0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
 
   private lateinit var trimmerView: RelativeLayout
 
@@ -295,6 +308,7 @@ class VideoTrimmerView(
     cropBtn = findViewById(R.id.cropBtn)
     muteBtn = findViewById(R.id.muteBtn)
     speedBtn = findViewById(R.id.speedBtn)
+    deleteBtn = findViewById(R.id.deleteBtn)
     undoBtn = findViewById(R.id.undoBtn)
     redoBtn = findViewById(R.id.redoBtn)
     videoContainer = findViewById(R.id.videoContainer)
@@ -540,6 +554,9 @@ class VideoTrimmerView(
     }
 
     endTime = if (mMaxDuration < mDuration) mMaxDuration else mDuration.toLong()
+    val restore = restoredEditState
+    restoredEditState = null
+    restore?.let { restoreTrimRange(it) }
     updateHandlePositions()
 
     loadingIndicator.visibility = View.GONE
@@ -551,6 +568,8 @@ class VideoTrimmerView(
       // cause an immediate pause (the old bug where autoplay appeared broken).
       val clampedJump = jumpToPositionOnLoad.coerceAtMost(endTime)
       seekTo(if (clampedJump > mDuration) mDuration.toLong() else clampedJump, true)
+    } else if (restore != null && startTime > 0) {
+      seekTo(startTime, true)
     }
 
     if (autoplay) {
@@ -578,6 +597,16 @@ class VideoTrimmerView(
     } else {
       // Fade the waveform in to match the trimmer container animation.
       waveformView?.animate()?.alpha(1f)?.setDuration(250)?.start()
+    }
+
+    if (restore != null && isVideoType) {
+      // updateVideoViewSize() sizes the video view in a posted runnable: queue behind it, then
+      // wait for the layout that follows so fit-scale and crop maths see real sizes.
+      videoContainer.post {
+        mVideoView.doOnLayout {
+          if (mediaPlayer != null) restoreTransforms(restore)
+        }
+      }
     }
 
     mOnTrimVideoListener.onLoad(mDuration)
@@ -655,20 +684,63 @@ class VideoTrimmerView(
   // consistent speed selector (equivalent to iOS's UIMenu on iOS 14+).
   private fun onSpeedTapped() {
     val popup = android.widget.PopupMenu(context, speedBtn)
-    speedOptions.forEachIndexed { index, opt ->
-      val title = if (opt == 1.0) "Normal (1x)" else "${opt}x"
-      popup.menu.add(0, index, index, title)
+    val options = speedMenuOptions()
+    options.forEachIndexed { index, opt ->
+      popup.menu.add(0, index, index, speedTitle(opt))
+        .setCheckable(true)
+        .setChecked(kotlin.math.abs(opt - speed) < 0.0001)
     }
+    val customId = options.size
+    popup.menu.add(1, customId, customId, "Custom…")
     popup.setOnMenuItemClickListener { item ->
-      setSpeed(speedOptions[item.itemId])
+      if (item.itemId == customId) promptCustomSpeed() else setSpeed(options[item.itemId])
       true
     }
     popup.show()
   }
 
+  /**
+   * The configured speeds, plus the current one when it isn't among them (a custom speed or one
+   * restored from `editState`), so the menu can always show what is selected.
+   */
+  private fun speedMenuOptions(): DoubleArray =
+    if (speedOptions.any { kotlin.math.abs(it - speed) < 0.0001 }) speedOptions
+    else (speedOptions + speed).sortedArray()
+
+  private fun speedLabel(value: Double): String =
+    if (value == 1.0) "1x" else "${java.math.BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()}x"
+
+  private fun speedTitle(value: Double): String = if (value == 1.0) "Normal (1x)" else speedLabel(value)
+
+  private fun promptCustomSpeed() {
+    val activity = mContext.currentActivity ?: return
+    val input = EditText(activity).apply {
+      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+      hint = "1.25"
+      setText(java.math.BigDecimal.valueOf(speed).stripTrailingZeros().toPlainString())
+      setSelection(text.length)
+    }
+    val padding = dpToPx(20)
+    val container = FrameLayout(activity).apply {
+      setPadding(padding, dpToPx(8), padding, 0)
+      addView(input)
+    }
+    AlertDialog.Builder(activity)
+      .setTitle("Custom speed")
+      .setMessage("Enter a speed from 0.25x to 4x.")
+      .setView(container)
+      .setNegativeButton("Cancel", null)
+      .setPositiveButton("Set") { _, _ ->
+        val value = input.text.toString().replace(',', '.').trim().toDoubleOrNull() ?: return@setPositiveButton
+        // Two decimals is as fine as anyone picks a speed; clamp to what export supports.
+        setSpeed((Math.round(value * 100) / 100.0).coerceIn(0.25, 4.0))
+      }
+      .show()
+  }
+
   private fun setSpeed(newSpeed: Double) {
     speed = newSpeed
-    speedBtn.text = if (newSpeed == 1.0) "1x" else "${newSpeed}x"
+    speedBtn.text = speedLabel(newSpeed)
     // Only apply playbackParams when actively playing. Calling setPlaybackParams() on a
     // prepared-but-paused MediaPlayer implicitly starts playback (Android docs), which
     // would silently resume the video when the user just wanted to pick a future speed.
@@ -709,6 +781,10 @@ class VideoTrimmerView(
     redoBtn.setOnClickListener { onRedoTapped() }
     muteBtn.setOnClickListener { onMuteTapped() }
     speedBtn.setOnClickListener { onSpeedTapped() }
+    deleteBtn.setOnClickListener {
+      onMediaPause()
+      mOnTrimVideoListener.onDelete()
+    }
 
     cropBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
     undoBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
@@ -717,6 +793,7 @@ class VideoTrimmerView(
 
   fun onSaveClicked() {
     onMediaPause()
+    savedEditState = serializeEditState()
     val vw = mediaPlayer?.videoWidth ?: 0
     val vh = mediaPlayer?.videoHeight ?: 0
     val bitrate = synchronized(retrieverLock) {
@@ -877,8 +954,22 @@ class VideoTrimmerView(
     }
     if (config.hasKey("speed") && config.getDouble("speed") > 0) {
       speed = config.getDouble("speed")
-      speedBtn.text = if (speed == 1.0) "1x" else "${speed}x"
     }
+    if (config.hasKey("speedOptions")) {
+      val array = config.getArray("speedOptions")
+      val valid = (0 until (array?.size() ?: 0)).map { array!!.getDouble(it) }.filter { it in 0.25..4.0 }
+      if (valid.isNotEmpty()) speedOptions = valid.toDoubleArray()
+    }
+    if (config.hasKey("editState")) {
+      config.getString("editState")?.let { TrimEditState.fromJson(it) }?.let { state ->
+        restoredEditState = state
+        isMuted = state.muted
+        speed = state.speed
+      }
+    }
+    speedBtn.text = speedLabel(speed)
+    enableDeleteButton = config.hasKey("enableDeleteButton") && config.getBoolean("enableDeleteButton")
+    deleteBtn.visibility = if (enableDeleteButton && isVideoType) View.VISIBLE else View.GONE
     muteBtn.setImageResource(if (isMuted) R.drawable.speaker_slash_fill else R.drawable.speaker_wave_2_fill)
     muteBtn.visibility = if (isVideoType) View.VISIBLE else View.GONE
 
@@ -985,6 +1076,7 @@ class VideoTrimmerView(
     redoBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
     muteBtn.setColorFilter(iconColor, android.graphics.PorterDuff.Mode.SRC_IN)
     speedBtn.setTextColor(iconColor)
+    deleteBtn.setColorFilter(iconColor, android.graphics.PorterDuff.Mode.SRC_IN)
 
     // Overlays
     leadingOverlay.setBackgroundColor(overlayColor)
@@ -2339,7 +2431,7 @@ class VideoTrimmerView(
     updateUndoRedoButtons()
   }
 
-  private fun applySnapshot(snap: TransformSnapshot) {
+  private fun applySnapshot(snap: TransformSnapshot, animated: Boolean = true) {
     val flipChanging = isFlipped != snap.isFlipped
     val prevRotationCount = rotationCount
 
@@ -2378,6 +2470,14 @@ class VideoTrimmerView(
     }
 
     mVideoView.animate().cancel()
+
+    if (!animated) {
+      mVideoView.rotation = cumulativeRotationDeg
+      mVideoView.scaleX = targetSx
+      mVideoView.scaleY = fitScale
+      onComplete.run()
+      return
+    }
 
     if (flipChanging) {
       val oddRotation = prevRotationCount % 2 != 0
@@ -2424,6 +2524,69 @@ class VideoTrimmerView(
         .start()
     }
   }
+
+  // region Edit state (restore a previous session)
+
+  /**
+   * Selects the saved trim range, provided it still fits this media and the configured min/max
+   * duration; otherwise the default full-range selection stays.
+   */
+  private fun restoreTrimRange(state: TrimEditState) {
+    val end = minOf(state.endMs, mDuration.toLong())
+    val start = state.startMs
+    if (start < 0 || end <= start) return
+    val length = end - start
+    if (length < mMinDuration || length > mMaxDuration) return
+    startTime = start
+    endTime = end
+  }
+
+  /**
+   * Applies the saved rotation / flip / crop without animation, so the editor opens already
+   * showing them. Undo history starts empty: the restored state is the new baseline.
+   */
+  private fun restoreTransforms(state: TrimEditState) {
+    val crop = state.crop?.let {
+      RectF(it.x.toFloat(), it.y.toFloat(), (it.x + it.w).toFloat(), (it.y + it.h).toFloat())
+    }
+    applySnapshot(
+      TransformSnapshot(
+        rotationCount = state.rotation,
+        isFlipped = state.flipped,
+        isCropActive = crop != null,
+        cropNormalized = crop,
+        // What the rotate/flip handlers accumulate: -90° per turn, mirrored while flipped.
+        cumulativeRotationDeg = if (state.flipped) state.rotation * 90f else -state.rotation * 90f
+      ),
+      animated = false
+    )
+  }
+
+  private fun serializeEditState(): String {
+    // getCropNormalizedRect() isn't clamped; float error can push an edge just past 0 or 1.
+    val crop = getCropNormalizedRect()?.let {
+      val x = it.left.coerceIn(0f, 1f)
+      val y = it.top.coerceIn(0f, 1f)
+      TrimEditState.Crop(
+        x.toDouble(),
+        y.toDouble(),
+        (it.right.coerceAtMost(1f) - x).toDouble(),
+        (it.bottom.coerceAtMost(1f) - y).toDouble()
+      )
+    }
+    return TrimEditState(
+      v = TrimEditState.CURRENT_VERSION,
+      startMs = startTime,
+      endMs = endTime,
+      rotation = rotationCount,
+      flipped = isFlipped,
+      crop = crop,
+      muted = isMuted,
+      speed = speed
+    ).toJson()
+  }
+
+  // endregion
 
   private fun updateUndoRedoButtons() {
     undoBtn.isEnabled = undoStack.isNotEmpty()

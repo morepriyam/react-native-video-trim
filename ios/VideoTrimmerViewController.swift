@@ -50,6 +50,8 @@ class VideoTrimmerViewController: UIViewController {
     private var saveButtonText = "Save"
     var cancelBtnClicked: (() -> Void)?
     var saveBtnClicked: ((CMTimeRange) -> Void)?
+    var deleteBtnClicked: (() -> Void)?
+    private var enableDeleteButton = false
     private var enableHapticFeedback = true
     private var enableEditTools = true
     private var zoomOnWaitingDuration: Double = 5.0 // Default: 5 seconds
@@ -66,7 +68,7 @@ class VideoTrimmerViewController: UIViewController {
     private var iconColor: UIColor { isLightTheme ? .black : .white }
     private var dimmedIconColor: UIColor { iconColor.withAlphaComponent(0.5) }
     private let symbolConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-    private let speedOptions: [Double] = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+    private var speedOptions: [Double] = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
     
     private let playerController = AVPlayerViewController()
     private var trimmer: VideoTrimmer!
@@ -85,6 +87,7 @@ class VideoTrimmerViewController: UIViewController {
     private var player: AVPlayer! { playerController.player }
     private var timeObserverToken: Any?
     private var statusObservation: NSKeyValueObservation?
+    private var rateObservation: NSKeyValueObservation?
     private var autoplay = false
     private var jumpToPositionOnLoad: Double = 0;
     private var headerText: String?
@@ -117,6 +120,10 @@ class VideoTrimmerViewController: UIViewController {
     private var undoBtn: UIButton?
     private var redoBtn: UIButton?
     private var preCropSnapshot: TransformSnapshot?
+    // Session to restore from `EditorConfig.editState`: mute/speed apply in configure, the
+    // trim range once the trimmer has its asset, transforms once the player is ready and
+    // laid out. Cleared after it has been applied.
+    private var restoredEditState: TrimEditState?
     
     
     var isSeekInProgress: Bool = false  // Marker
@@ -250,6 +257,8 @@ class VideoTrimmerViewController: UIViewController {
         
         statusObservation?.invalidate()
         statusObservation = nil
+        rateObservation?.invalidate()
+        rateObservation = nil
         
         if let token = timeObserverToken {
             player.removeTimeObserver(token)
@@ -273,7 +282,10 @@ class VideoTrimmerViewController: UIViewController {
     }
     
     @objc private func togglePlay(sender: UIButton) {
-        if player.timeControlStatus == .playing {
+        // `rate` is the play/pause intent: it is non-zero from play() on, even while the player
+        // is still buffering (timeControlStatus == .waitingToPlayAtSpecifiedRate). Branching on
+        // timeControlStatus made a second tap during that window call play() again.
+        if player.rate != 0 {
             player.pause()
         } else {
             if CMTimeCompare(trimmer.progress, trimmer.selectedRange.end) != -1 {
@@ -436,6 +448,10 @@ class VideoTrimmerViewController: UIViewController {
             trimmer.minimumDuration = CMTime(seconds: max(1, Double(minDuration) / 1000.0), preferredTimescale: 600)
         }
         
+        if let state = restoredEditState {
+            restoreTrimRange(state)
+        }
+
         trimmer.addTarget(self, action: #selector(didBeginScrubbing(_:)), for: VideoTrimmer.didBeginScrubbing)
         trimmer.addTarget(self, action: #selector(didEndScrubbing(_:)), for: VideoTrimmer.didEndScrubbing)
         trimmer.addTarget(self, action: #selector(progressDidChanged(_:)), for: VideoTrimmer.progressChanged)
@@ -482,6 +498,13 @@ class VideoTrimmerViewController: UIViewController {
         statusObservation = player.observe(\.status, options: [.new, .initial]) { [weak self] player, _ in
             DispatchQueue.main.async {
                 self?.onPlayerReady()
+            }
+        }
+        // Drive the play/pause icon from the player itself, so it follows every start/stop
+        // (range end, item end, scrubbing, speed changes) instead of being set by guesswork.
+        rateObservation = player.observe(\.rate, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.setPlayBtnIcon()
             }
         }
         
@@ -559,8 +582,7 @@ class VideoTrimmerViewController: UIViewController {
         self.muteBtn = muteButton
         
         let speedButton = UIButton(type: .system)
-        let speedLabel = speed == 1.0 ? "1x" : "\(speed)x"
-        speedButton.setTitle(speedLabel, for: .normal)
+        speedButton.setTitle(Self.speedLabel(speed), for: .normal)
         speedButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
         speedButton.tintColor = iconColor
         if #available(iOS 14.0, *) {
@@ -588,6 +610,19 @@ class VideoTrimmerViewController: UIViewController {
         let leftStack = UIStackView(arrangedSubviews: [flipBtn, rotateBtn, cropButton, muteButton, speedButton])
         leftStack.axis = .horizontal
         leftStack.spacing = 12
+        
+        if enableDeleteButton {
+            let deleteButton = UIButton(type: .system)
+            deleteButton.setImage(UIImage(systemName: "trash", withConfiguration: symbolConfig), for: .normal)
+            deleteButton.tintColor = iconColor
+            deleteButton.accessibilityLabel = "Delete"
+            deleteButton.addTarget(self, action: #selector(onDeleteTapped), for: .touchUpInside)
+            leftStack.addArrangedSubview(deleteButton)
+            NSLayoutConstraint.activate([
+                deleteButton.widthAnchor.constraint(equalToConstant: 28),
+                deleteButton.heightAnchor.constraint(equalToConstant: 28),
+            ])
+        }
         
         let rightStack = UIStackView(arrangedSubviews: [undoButton, redoButton])
         rightStack.axis = .horizontal
@@ -640,28 +675,69 @@ class VideoTrimmerViewController: UIViewController {
     // long-press gesture. Falls back to UIAlertController on older iOS versions.
     @available(iOS 14.0, *)
     private func buildSpeedMenu() -> UIMenu {
-        let actions = speedOptions.map { opt in
-            let title = opt == 1.0 ? "Normal (1x)" : "\(opt)x"
+        let actions = speedMenuOptions().map { opt in
             let isSelected = abs(opt - speed) < 0.0001
-            return UIAction(title: title, state: isSelected ? .on : .off) { [weak self] _ in
+            return UIAction(title: Self.speedTitle(opt), state: isSelected ? .on : .off) { [weak self] _ in
                 self?.setSpeed(opt)
             }
         }
-        return UIMenu(title: "", children: actions)
+        let custom = UIAction(title: "Custom…") { [weak self] _ in
+            self?.promptCustomSpeed()
+        }
+        return UIMenu(title: "", children: actions + [UIMenu(title: "", options: .displayInline, children: [custom])])
+    }
+    
+    /// The configured speeds, plus the current one when it isn't among them (a custom speed or
+    /// one restored from `editState`), so the menu can always show what is selected.
+    private func speedMenuOptions() -> [Double] {
+        if speedOptions.contains(where: { abs($0 - speed) < 0.0001 }) {
+            return speedOptions
+        }
+        return (speedOptions + [speed]).sorted()
+    }
+    
+    private static func speedLabel(_ value: Double) -> String {
+        value == 1.0 ? "1x" : String(format: "%gx", value)
+    }
+    
+    private static func speedTitle(_ value: Double) -> String {
+        value == 1.0 ? "Normal (1x)" : speedLabel(value)
+    }
+    
+    private func promptCustomSpeed() {
+        let alert = UIAlertController(title: "Custom speed", message: "Enter a speed from 0.25x to 4x.", preferredStyle: .alert)
+        alert.overrideUserInterfaceStyle = isLightTheme ? .light : .dark
+        let current = speed
+        alert.addTextField { field in
+            field.keyboardType = .decimalPad
+            field.placeholder = "1.25"
+            field.text = String(format: "%g", current)
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Set", style: .default) { [weak self, weak alert] _ in
+            guard let self = self,
+                  let text = alert?.textFields?.first?.text,
+                  let value = Double(text.replacingOccurrences(of: ",", with: ".").trimmingCharacters(in: .whitespaces)) else { return }
+            // Two decimals is as fine as anyone picks a speed; clamp to what export supports.
+            self.setSpeed(min(4.0, max(0.25, (value * 100).rounded() / 100)))
+        })
+        present(alert, animated: true)
     }
 
     /// Fallback for iOS < 14 where UIMenu is unavailable.
     @objc private func onSpeedTapped() {
         let alert = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
         alert.overrideUserInterfaceStyle = isLightTheme ? .light : .dark
-        for opt in speedOptions {
-            let title = opt == 1.0 ? "Normal (1x)" : "\(opt)x"
+        for opt in speedMenuOptions() {
             let isSelected = abs(opt - speed) < 0.0001
-            let action = UIAlertAction(title: title, style: isSelected ? .destructive : .default) { [weak self] _ in
+            let action = UIAlertAction(title: Self.speedTitle(opt), style: isSelected ? .destructive : .default) { [weak self] _ in
                 self?.setSpeed(opt)
             }
             alert.addAction(action)
         }
+        alert.addAction(UIAlertAction(title: "Custom…", style: .default) { [weak self] _ in
+            self?.promptCustomSpeed()
+        })
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         if let pop = alert.popoverPresentationController, let btn = speedBtn {
             pop.sourceView = btn
@@ -672,18 +748,24 @@ class VideoTrimmerViewController: UIViewController {
     
     private func setSpeed(_ newSpeed: Double) {
         speed = newSpeed
-        let label = newSpeed == 1.0 ? "1x" : "\(newSpeed)x"
-        speedBtn?.setTitle(label, for: .normal)
+        speedBtn?.setTitle(Self.speedLabel(newSpeed), for: .normal)
         if #available(iOS 14.0, *) {
             speedBtn?.menu = buildSpeedMenu()
         }
-        player.rate = Float(newSpeed)
-        if player.timeControlStatus != .playing {
-            player.pause()
+        // A non-zero rate starts playback, so only apply it live while playing; togglePlay
+        // applies `speed` on the next play. (Setting it and pausing again when "not .playing"
+        // also paused a player that was merely buffering.)
+        if player.rate != 0 {
+            player.rate = Float(newSpeed)
         }
         if enableHapticFeedback {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
+    }
+    
+    @objc private func onDeleteTapped() {
+        pausePlayer()
+        deleteBtnClicked?()
     }
     
     @objc private func onFlipTapped() {
@@ -800,7 +882,7 @@ class VideoTrimmerViewController: UIViewController {
         updateUndoRedoButtons()
     }
     
-    private func applySnapshot(_ snap: TransformSnapshot) {
+    private func applySnapshot(_ snap: TransformSnapshot, animated: Bool = true) {
         rotationCount = snap.rotationCount
         isFlipped = snap.isFlipped
         
@@ -810,9 +892,10 @@ class VideoTrimmerViewController: UIViewController {
         isCropActive = snap.isCropActive
         cropBtn?.tintColor = isCropActive ? iconColor : dimmedIconColor
         
-        UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut]) {
+        let applyTransform = {
             self.playerController.view.transform = transform
-        } completion: { _ in
+        }
+        let applyCrop = {
             if self.isCropActive {
                 self.showCropOverlayImmediate()
                 self.updateCropAllowedRect()
@@ -825,6 +908,15 @@ class VideoTrimmerViewController: UIViewController {
                 self.cropOverlayView?.isHidden = true
                 self.cropOverlayView?.alpha = 0
             }
+        }
+
+        if animated {
+            UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut], animations: applyTransform) { _ in
+                applyCrop()
+            }
+        } else {
+            applyTransform()
+            applyCrop()
         }
     }
     
@@ -844,6 +936,53 @@ class VideoTrimmerViewController: UIViewController {
         undoBtn?.isEnabled = !undoStack.isEmpty
         redoBtn?.tintColor = redoStack.isEmpty ? dimmedIconColor : iconColor
         redoBtn?.isEnabled = !redoStack.isEmpty
+    }
+    
+    // MARK: - Edit state (restore a previous session)
+
+    /// Selects the saved trim range, provided it still fits this asset and the configured
+    /// min/max duration; otherwise the trimmer keeps its default full-range selection.
+    private func restoreTrimRange(_ state: TrimEditState) {
+        guard let duration = asset?.duration, duration.seconds > 0 else { return }
+        let start = CMTime(value: CMTimeValue(state.startMs.rounded()), timescale: 1000)
+        let end = CMTimeMinimum(CMTime(value: CMTimeValue(state.endMs.rounded()), timescale: 1000), duration)
+        guard start >= .zero, end > start else { return }
+        let length = CMTimeSubtract(end, start)
+        guard length >= trimmer.minimumDuration, length <= trimmer.maximumDuration else { return }
+        trimmer.selectedRange = CMTimeRange(start: start, end: end)
+        trimmer.progress = start
+    }
+
+    /// Applies the saved rotation / flip / crop without animation, so the editor opens already
+    /// showing them. Undo history starts empty: the restored state is the new baseline.
+    private func restoreTransforms(_ state: TrimEditState) {
+        guard isVideoType else { return }
+        let crop = state.crop.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h) }
+        // Transform and crop maths read the player/container bounds.
+        view.layoutIfNeeded()
+        applySnapshot(TransformSnapshot(
+            rotationCount: state.rotation,
+            isFlipped: state.flipped,
+            isCropActive: crop != nil,
+            cropNormalized: crop
+        ), animated: false)
+    }
+
+    /// The current session as an `editState` string for `onFinishTrimming`.
+    func editStateJSON(startMs: Double, endMs: Double) -> String? {
+        let crop = cropNormalizedRect.map {
+            TrimEditState.Crop(x: Double($0.minX), y: Double($0.minY), w: Double($0.width), h: Double($0.height))
+        }
+        return TrimEditState(
+            v: TrimEditState.currentVersion,
+            startMs: startMs,
+            endMs: endMs,
+            rotation: rotationCount,
+            flipped: isFlipped,
+            crop: crop,
+            muted: isMuted,
+            speed: speed
+        ).encoded()
     }
     
     // MARK: - Crop
@@ -1018,7 +1157,8 @@ class VideoTrimmerViewController: UIViewController {
     }
     
     private func setPlayBtnIcon() {
-        self.playBtn.setImage(self.player.timeControlStatus == .playing ? self.pauseIcon : self.playIcon, for: .normal)
+        guard let player = self.player else { return }
+        self.playBtn.setImage(player.rate != 0 ? self.pauseIcon : self.playIcon, for: .normal)
     }
     
     // ====Smoother seek
@@ -1080,6 +1220,19 @@ class VideoTrimmerViewController: UIViewController {
     if let cfgSpeed = config["speed"] as? Double {
         speed = cfgSpeed
     }
+    if let options = config["speedOptions"] as? [Double] {
+        let valid = options.filter { (0.25...4.0).contains($0) }
+        if !valid.isEmpty {
+            speedOptions = valid
+        }
+    }
+    enableDeleteButton = config["enableDeleteButton"] as? Bool ?? false
+    if let json = config["editState"] as? String, let state = TrimEditState.decode(json) {
+        restoredEditState = state
+        // Set before the toolbar is built so the mute icon and speed label start correct.
+        isMuted = state.muted
+        speed = state.speed
+    }
     headerText = config["headerText"] as? String
     headerTextSize = config["headerTextSize"] as? Int ?? 16
     headerTextColor = config["headerTextColor"] as? Double
@@ -1123,6 +1276,14 @@ class VideoTrimmerViewController: UIViewController {
             self.transformStackView?.alpha = 1
         })
         
+        if let state = restoredEditState {
+            restoredEditState = nil
+            restoreTransforms(state)
+            if jumpToPositionOnLoad <= 0 {
+                seek(to: trimmer.selectedRange.start)
+            }
+        }
+
         if jumpToPositionOnLoad > 0 {
             let duration = (asset?.duration.seconds ?? 0) * 1000
             let endMs = trimmer.selectedRange.end.seconds * 1000
@@ -1171,5 +1332,53 @@ private extension UILabel {
         label.textAlignment = textAlignment
         label.textColor = textColor
         return label
+    }
+}
+
+/// A saved editing session, round-tripped through JS as an opaque string
+/// (`onFinishTrimming.editState` → `EditorConfig.editState`) so the editor can reopen where
+/// the user left off. Android writes and reads the same JSON — keep the two in sync.
+/// `crop` is normalized (0–1) to the displayed video after rotation/flip; nil = not cropped.
+struct TrimEditState: Codable {
+    static let currentVersion = 1
+    
+    struct Crop: Codable {
+        let x: Double
+        let y: Double
+        let w: Double
+        let h: Double
+    }
+    
+    let v: Int
+    let startMs: Double
+    let endMs: Double
+    let rotation: Int
+    let flipped: Bool
+    var crop: Crop?
+    let muted: Bool
+    let speed: Double
+    
+    /// Nil for malformed, out-of-range or newer-version input, so a bad value degrades to
+    /// "open fresh" rather than a broken editor. An invalid crop alone is dropped.
+    static func decode(_ json: String) -> TrimEditState? {
+        guard let data = json.data(using: .utf8),
+              var state = try? JSONDecoder().decode(TrimEditState.self, from: data),
+              (1...currentVersion).contains(state.v),
+              state.startMs >= 0, state.endMs > state.startMs,
+              (0..<4).contains(state.rotation),
+              (0.25...4.0).contains(state.speed) else { return nil }
+        if let c = state.crop {
+            let eps = 0.001
+            let valid = c.x >= 0 && c.y >= 0 && c.w > 0 && c.h > 0 && c.x + c.w <= 1 + eps && c.y + c.h <= 1 + eps
+            if !valid {
+                state.crop = nil
+            }
+        }
+        return state
+    }
+    
+    func encoded() -> String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }

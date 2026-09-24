@@ -561,8 +561,12 @@ All configuration options are optional. Here are the most commonly used ones:
 | `minDuration` | `number` | `1000` | Minimum duration in milliseconds |
 | `autoplay` | `boolean` | `false` | Auto-play media on load |
 | `jumpToPositionOnLoad` | `number` | - | Initial position in milliseconds |
+| `editState` | `string` | - | Reopen with a previous session's settings: pass back the `editState` from an earlier `onFinishTrimming` (same source file). Restores trim range, rotation, flip, crop, mute and speed |
 | `removeAudio` | `boolean` | `false` | Strip the audio track from the output (see [Mute Audio](#mute-audio--remove-audio)) |
 | `speed` | `number` | `1.0` | Playback speed multiplier (0.25–4.0). Forces re-encoding when ≠ 1.0 (see [Speed Adjustment](#speed-adjustment)) |
+| `speedOptions` | `number[]` | `[0.25, 0.5, 1, 1.5, 2, 3, 4]` | Speeds listed in the editor's speed menu; a "Custom…" entry always follows for any other value in 0.25–4.0 |
+| `enableDeleteButton` | `boolean` | `false` | Show a trash button in the edit toolbar; deleting closes the editor and emits `onDelete` |
+| `enableDeleteDialog` | `boolean` | `true` | Confirm before emitting `onDelete` (`deleteDialogTitle` / `deleteDialogMessage` / `deleteDialogCancelText` / `deleteDialogConfirmText`) |
 
 ### Save & Share Options
 

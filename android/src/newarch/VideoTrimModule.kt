@@ -21,6 +21,7 @@ class VideoTrimModule(
         "onHide" -> emitOnHide()
         "onShow" -> emitOnShow()
         "onCancel" -> emitOnCancel()
+        "onDelete" -> emitOnDelete()
         "onStartTrimming" -> emitOnStartTrimming()
         "onFinishTrimming" -> emitOnFinishTrimming(params)
         "onCancelTrimming" -> emitOnCancelTrimming()
