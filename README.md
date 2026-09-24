@@ -431,8 +431,11 @@ merge(urls: string[], options?: Partial<MergeOptions>): Promise<MergeResult>
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `outputExt` | `string` | `"mp4"` | Output file extension |
+| `targetWidth` / `targetHeight` | `number` | - | Pin the output canvas (display size); see the note below |
+| `targetFps` / `targetCodec` | `number` / `string` | - | With a pinned canvas: output fps and codec family (`"h264"` / `"hevc"`) |
+| `clipEdits` | `string[]` | - | One editor `editState` per URL (`""` = no edit). Each clip is cut, rotated / flipped / cropped, retimed and muted as saved, inside this merge — store edits as settings (`renderOnSave: false` + `onSaveEditState`) and render once here |
 
-**Returns:** `{ outputPath: string, duration: number }` (duration in milliseconds)
+**Returns:** `{ outputPath: string, duration: number, usedFastPath?: boolean, selective?: boolean, degraded?: boolean }` (duration in milliseconds)
 
 > **Note:** Merge uses FFmpeg's concat filter with hardware-accelerated re-encoding (h264_videotoolbox on iOS, h264_mediacodec on Android). Input clips can have different codecs, resolutions, or frame rates — each input is automatically scaled, padded (letterboxed/pillarboxed), and frame-rate-normalized to match the dominant display geometry across the inputs (most frequent dimensions; ties broken by first occurrence, so the canvas never depends on clip order; fps capped at 30). Apps with a fixed output contract can pin the canvas instead via `targetWidth`/`targetHeight` (+ optional `targetFps`/`targetCodec`) — clips already matching the pin join losslessly, everything else conforms into it, and the result reports `degraded: true` if an emergency encoder fallback couldn't satisfy the pin. The output bitrate matches the highest-quality input to preserve quality.
 >
@@ -562,6 +565,7 @@ All configuration options are optional. Here are the most commonly used ones:
 | `autoplay` | `boolean` | `false` | Auto-play media on load |
 | `jumpToPositionOnLoad` | `number` | - | Initial position in milliseconds |
 | `editState` | `string` | - | Reopen with a previous session's settings: pass back the `editState` from an earlier `onFinishTrimming` (same source file). Restores trim range, rotation, flip, crop, mute, speed and the undo/redo history |
+| `renderOnSave` | `boolean` | `true` | `false`: Save encodes nothing — emits `onSaveEditState` with the `editState` and closes (render later, e.g. with `merge()`'s `clipEdits`) |
 | `removeAudio` | `boolean` | `false` | Strip the audio track from the output (see [Mute Audio](#mute-audio--remove-audio)) |
 | `speed` | `number` | `1.0` | Playback speed multiplier (0.25–4.0). Forces re-encoding when ≠ 1.0 (see [Speed Adjustment](#speed-adjustment)) |
 | `speedOptions` | `number[]` | `[0.25, 0.5, 1, 1.5, 2, 3, 4]` | Speeds listed in the editor's speed menu; a "Custom…" entry always follows for any other value in 0.25–4.0 |

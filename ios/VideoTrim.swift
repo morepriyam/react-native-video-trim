@@ -100,6 +100,11 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
   }
   // Delete-button options are newer than the rest of the config, so read them leniently
   // (an old-arch host that doesn't send them gets the defaults instead of a crash).
+  private var renderOnSave: Bool {
+    get {
+      return editorConfig?["renderOnSave"] as? Bool ?? true
+    }
+  }
   private var enableDeleteDialog: Bool {
     get {
       return editorConfig?["enableDeleteDialog"] as? Bool ?? true
@@ -300,8 +305,56 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     }
   }
   
+  /// Display size of an asset's video track: its coded size with the source rotation matrix
+  /// applied (w/h swapped for ±90°). Nil when there is no video track.
+  static func displaySize(of asset: AVAsset) -> CGSize? {
+    guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+    let raw = track.naturalSize
+    let pt = track.preferredTransform
+    let angle = atan2(pt.b, pt.a)
+    let isSrcRotated = abs(angle - .pi / 2) < 0.1 || abs(angle + .pi / 2) < 0.1
+    return isSrcRotated ? CGSize(width: raw.height, height: raw.width) : raw
+  }
+
+  /// FFmpeg video filters for a user edit — rotate (counter-clockwise quarter turns), flip,
+  /// crop (normalized to the displayed frame after rotate/flip) and speed — in the order the
+  /// editor applies them. They operate on FFmpeg's autorotated input: we let FFmpeg bake the
+  /// source rotation matrix into upright pixels (no -noautorotate; the old manual compensation
+  /// double-rotated tagged portrait clips on ffmpeg-kit 6), so `displaySize` is the source's
+  /// display size. Shared by the editor's trim and by merge's per-clip edits.
+  static func editVideoFilters(rotation: Int, flipped: Bool, crop: CGRect?, displaySize: CGSize, speed: Double) -> [String] {
+    var filters: [String] = []
+    switch rotation {
+    case 1: filters.append("transpose=2")
+    case 2:
+      filters.append("transpose=2")
+      filters.append("transpose=2")
+    case 3: filters.append("transpose=1")
+    default: break
+    }
+    if flipped {
+      filters.append("hflip")
+    }
+    if let cn = crop, displaySize.width > 0, displaySize.height > 0 {
+      let postW = rotation % 2 != 0 ? displaySize.height : displaySize.width
+      let postH = rotation % 2 != 0 ? displaySize.width : displaySize.height
+      let cx = Int(round(cn.origin.x * postW))
+      let cy = Int(round(cn.origin.y * postH))
+      // H.264 requires even dimensions; round down to nearest even number.
+      let cw = Int(round(cn.size.width * postW)) & ~1
+      let ch = Int(round(cn.size.height * postH)) & ~1
+      if cw > 0 && ch > 0 {
+        filters.append("crop=\(cw):\(ch):\(cx):\(cy)")
+      }
+    }
+    if abs(speed - 1.0) > 0.0001 {
+      filters.append("setpts=\(1.0 / speed)*PTS")
+    }
+    return filters
+  }
+
   /// Chains FFmpeg `atempo` filters so each stage stays within 0.5–2.0.
-  private func buildAtempoChain(_ speed: Double) -> String {
+  static func buildAtempoChain(_ speed: Double) -> String {
     var remaining = speed
     var filters: [String] = []
     while remaining < 0.5 {
@@ -318,7 +371,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
 
   /// Snapshot of a source's stream codecs, used to decide whether we can
   /// stream-copy (fast, lossless) or must transcode for container compatibility.
-  private struct SourceMediaInfo {
+  struct SourceMediaInfo {
     let hasAudio: Bool
     /// True when the source audio codec can live in an MP4 container as-is
     /// (AAC family / ALAC). Non-MP4 codecs (e.g. Opus, Vorbis) must be
@@ -350,7 +403,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
   /// synchronously against already-local files, so it is cheap. When a codec
   /// can't be determined, we assume audio is compatible so we don't force an
   /// unnecessary re-encode on the common case.
-  private func probeSourceMedia(_ asset: AVAsset) -> SourceMediaInfo {
+  static func probeSourceMedia(_ asset: AVAsset) -> SourceMediaInfo {
     var hasAudio = false
     var audioIsMP4Compatible = true
     if let audioTrack = asset.tracks(withMediaType: .audio).first,
@@ -378,7 +431,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
   /// Preserves the fast, lossless `-c:a copy` passthrough whenever the source
   /// audio is already MP4-compatible; only transcodes to AAC when it must — a
   /// speed change (retimed audio), or a container-incompatible codec like Opus.
-  private func audioArgs(stripAudio: Bool, needsSpeed: Bool, speed: Double, info: SourceMediaInfo) -> [String] {
+  static func audioArgs(stripAudio: Bool, needsSpeed: Bool, speed: Double, info: SourceMediaInfo) -> [String] {
     if stripAudio {
       return ["-an"]
     }
@@ -392,8 +445,30 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     return ["-c:a", "copy"]
   }
 
+  /// `renderOnSave: false`: hand the session back as settings and close — nothing is encoded.
+  private func saveEditState(viewController: VideoTrimmerViewController, startTime: Double, endTime: Double) {
+    viewController.pausePlayer()
+    let startMs = (startTime * 1000).rounded()
+    let endMs = (endTime * 1000).rounded()
+    guard let editState = viewController.editStateJSON(startMs: startMs, endMs: endMs) else {
+      onError(message: "Could not save the edit", code: .trimmingFailed)
+      return
+    }
+    emitEventToJS("onSaveEditState", eventData: [
+      "editState": editState,
+      "startTime": startMs,
+      "endTime": endMs,
+      "duration": ((endMs - startMs) / viewController.speed).rounded(),
+    ])
+    closeEditor()
+  }
+
   private func trim(viewController: VideoTrimmerViewController, inputFile: URL, videoDuration: Double, startTime: Double, endTime: Double, isVideoType: Bool) {
     guard !isTrimming else { return }
+    if !renderOnSave {
+      saveEditState(viewController: viewController, startTime: startTime, endTime: endTime)
+      return
+    }
     isTrimming = true
 
     vc?.pausePlayer()
@@ -495,60 +570,13 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     let needsReEncode = hasUserTransform || cropNorm != nil || enablePreciseTrimming || needsSpeed
     
     if needsReEncode, let vc = vc {
-      // Let FFmpeg autorotate the source (note: NO -noautorotate below). Autorotate bakes
-      // the source rotation matrix into upright, display-orientation pixels AND strips the
-      // matrix from the output. The previous approach (-noautorotate + a manual source-
-      // compensation transpose) baked the pixels but left the source rotation matrix on the
-      // output, so on ffmpeg-kit 6 every rotation-tagged portrait clip came out
-      // double-rotated (sideways). User rotate/flip and crop below operate on the already-
-      // upright autorotated frame, so their math is unchanged.
-      switch vc.rotationCount {
-      case 1: videoFilters.append("transpose=2")
-      case 2:
-        videoFilters.append("transpose=2")
-        videoFilters.append("transpose=2")
-      case 3: videoFilters.append("transpose=1")
-      default: break
-      }
-      if vc.isFlipped {
-        videoFilters.append("hflip")
-      }
-      
-      if let cn = cropNorm, let asset = vc.asset,
-         let track = asset.tracks(withMediaType: .video).first {
-        let raw = track.naturalSize
-        let pt = track.preferredTransform
-        let angle = atan2(pt.b, pt.a)
-        let isSrcRotated = abs(angle - .pi / 2) < 0.1 || abs(angle + .pi / 2) < 0.1
-        let corrected = isSrcRotated
-            ? CGSize(width: raw.height, height: raw.width)
-            : raw
-        
-        let postW: CGFloat
-        let postH: CGFloat
-        if vc.rotationCount % 2 != 0 {
-          postW = corrected.height
-          postH = corrected.width
-        } else {
-          postW = corrected.width
-          postH = corrected.height
-        }
-        
-        let cx = Int(round(cn.origin.x * postW))
-        let cy = Int(round(cn.origin.y * postH))
-        var cw = Int(round(cn.size.width * postW))
-        var ch = Int(round(cn.size.height * postH))
-        // H.264 requires even dimensions; round down to nearest even number.
-        cw = cw & ~1
-        ch = ch & ~1
-        if cw > 0 && ch > 0 {
-          videoFilters.append("crop=\(cw):\(ch):\(cx):\(cy)")
-        }
-      }
-    }
-    
-    if needsReEncode && needsSpeed {
-      videoFilters.append("setpts=\(1.0 / playbackSpeed)*PTS")
+      videoFilters = VideoTrim.editVideoFilters(
+        rotation: vc.rotationCount,
+        flipped: vc.isFlipped,
+        crop: cropNorm,
+        displaySize: vc.asset.flatMap(VideoTrim.displaySize(of:)) ?? .zero,
+        speed: playbackSpeed
+      )
     }
     
     guard let outputFile = outputFile else {
@@ -558,7 +586,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
 
     // Probe the source once so both the re-encode and stream-copy branches can
     // keep audio passthrough when it is MP4-safe and only transcode when it isn't.
-    let mediaInfo = probeSourceMedia(vc?.asset ?? AVURLAsset(url: inputFile))
+    let mediaInfo = VideoTrim.probeSourceMedia(vc?.asset ?? AVURLAsset(url: inputFile))
 
     if needsReEncode {
       // Preserve source quality by matching the original bitrate. Falls back to 10 Mbps
@@ -596,7 +624,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         "-b:v",
         bitrateStr,
       ])
-      cmds.append(contentsOf: audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: playbackSpeed, info: mediaInfo))
+      cmds.append(contentsOf: VideoTrim.audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: playbackSpeed, info: mediaInfo))
       cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
@@ -830,7 +858,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
     // Probe the source once so both branches can keep audio passthrough when it
     // is MP4-safe and only transcode when it isn't.
     let asset = AVURLAsset(url: destPath)
-    let mediaInfo = probeSourceMedia(asset)
+    let mediaInfo = VideoTrim.probeSourceMedia(asset)
 
     if needsReEncode {
       // Match source bitrate to preserve quality; fall back to 10 Mbps.
@@ -864,7 +892,7 @@ public class VideoTrim: RCTEventEmitter, AssetLoaderDelegate, UIDocumentPickerDe
         "-b:v",
         bitrateStr,
       ])
-      cmds.append(contentsOf: audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: speed, info: mediaInfo))
+      cmds.append(contentsOf: VideoTrim.audioArgs(stripAudio: stripAudio, needsSpeed: needsSpeed, speed: speed, info: mediaInfo))
       cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputExt))
       cmds.append(contentsOf: [
         "-metadata",
@@ -1403,6 +1431,52 @@ extension VideoTrim {
   // MARK: - Headless API: getFrameAt
   // Extracts a single video frame as JPEG/PNG using AVAssetImageGenerator.
   // Output goes to the caches directory (OS-managed, auto-purged under storage pressure).
+
+  // An upright frame rendered as an edit would render it: turned counter-clockwise `rotation`
+  // quarter turns, then mirrored, then cropped (normalized to the rotated frame) — the same
+  // order as editVideoFilters. CG's y-up space means a positive angle turns counter-clockwise.
+  private static func applyEdit(to image: CGImage, rotation: Int, flipped: Bool, crop: CGRect?) -> CGImage? {
+    var img = image
+    let turns = ((rotation % 4) + 4) % 4
+    if turns != 0 || flipped {
+      let w = img.width, h = img.height
+      let outW = turns % 2 == 0 ? w : h
+      let outH = turns % 2 == 0 ? h : w
+      guard let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+      ctx.translateBy(x: CGFloat(outW) / 2, y: CGFloat(outH) / 2)
+      if flipped { ctx.scaleBy(x: -1, y: 1) }
+      ctx.rotate(by: CGFloat(turns) * .pi / 2)
+      ctx.draw(img, in: CGRect(x: -CGFloat(w) / 2, y: -CGFloat(h) / 2, width: CGFloat(w), height: CGFloat(h)))
+      guard let out = ctx.makeImage() else { return nil }
+      img = out
+    }
+    if let c = crop {
+      let W = CGFloat(img.width), H = CGFloat(img.height)
+      let rect = CGRect(x: c.minX * W, y: c.minY * H, width: c.width * W, height: c.height * H).integral
+      guard let cropped = img.cropping(to: rect) else { return nil }
+      img = cropped
+    }
+    return img
+  }
+
+  // Shrink (never enlarge) to fit maxWidth/maxHeight (-1 = unbounded), keeping the aspect ratio.
+  private static func fit(_ image: CGImage, maxWidth: Int, maxHeight: Int) -> CGImage? {
+    let w = CGFloat(image.width), h = CGFloat(image.height)
+    let rw = maxWidth > 0 ? CGFloat(maxWidth) / w : 1
+    let rh = maxHeight > 0 ? CGFloat(maxHeight) / h : 1
+    let ratio = min(rw, rh, 1)
+    guard ratio < 1 else { return image }
+    let outW = max(1, Int(w * ratio)), outH = max(1, Int(h * ratio))
+    guard let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.interpolationQuality = .high
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+    return ctx.makeImage()
+  }
+
   @objc
   public static func getFrameAt(_ url: String, options: NSDictionary, completion: @escaping ([String: Any]) -> Void) {
     let destPath = URL(string: url) ?? URL(fileURLWithPath: url)
@@ -1413,6 +1487,7 @@ extension VideoTrim {
     let quality = qualityNum?.intValue ?? 80
     let maxWidth = options["maxWidth"] as? Int ?? -1
     let maxHeight = options["maxHeight"] as? Int ?? -1
+    let edit = ClipEdit(json: options["editState"] as? String)
 
     DispatchQueue.global(qos: .userInitiated).async {
       let asset = AVURLAsset(url: destPath)
@@ -1421,7 +1496,9 @@ extension VideoTrim {
       generator.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
       generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
 
-      if maxWidth > 0 || maxHeight > 0 {
+      // With an edit, decode at full size: the crop would otherwise cut into an already-shrunk
+      // frame. The edited image is fitted to maxWidth/maxHeight afterwards.
+      if edit == nil && (maxWidth > 0 || maxHeight > 0) {
         let w = maxWidth > 0 ? maxWidth : 0
         let h = maxHeight > 0 ? maxHeight : 0
         generator.maximumSize = CGSize(width: CGFloat(w), height: CGFloat(h))
@@ -1436,7 +1513,14 @@ extension VideoTrim {
       let cmTime = CMTime(value: CMTimeValue(time), timescale: 1000)
 
       do {
-        let cgImage = try generator.copyCGImage(at: cmTime, actualTime: nil)
+        var cgImage = try generator.copyCGImage(at: cmTime, actualTime: nil)
+        if let e = edit {
+          guard let edited = applyEdit(to: cgImage, rotation: e.rotation, flipped: e.flipped, crop: e.crop) else {
+            completion(["error": "Failed to apply the edit to the frame"])
+            return
+          }
+          cgImage = fit(edited, maxWidth: maxWidth, maxHeight: maxHeight) ?? edited
+        }
         let uiImage = UIImage(cgImage: cgImage)
 
         let timestamp = Int(Date().timeIntervalSince1970 * 1000)
@@ -1954,29 +2038,84 @@ extension VideoTrim {
   // lists. Host-validated: a camera-encoded hevc clip joined with a videotoolbox-encoded one
   // decodes cleanly and keeps exact duration; a mid-GOP trim came out sample-exact (0.600s).
 
+  // A clip's user edit for merge — one entry of `clipEdits`, i.e. an editor `editState` string.
+  // Trims and mute can be applied to compressed samples (composition time ranges / omitting the
+  // audio segment); rotate/flip/crop/speed need a decode + re-encode (`needsRender`).
+  struct ClipEdit {
+    let startMs: Double
+    let endMs: Double
+    let rotation: Int
+    let flipped: Bool
+    let crop: CGRect?
+    let muted: Bool
+    let speed: Double
+
+    var needsRender: Bool {
+      rotation != 0 || flipped || crop != nil || abs(speed - 1.0) > 0.0001
+    }
+
+    init?(json: String?) {
+      guard let json = json, !json.isEmpty, let s = TrimEditState.decode(json) else { return nil }
+      startMs = s.startMs
+      endMs = s.endMs
+      rotation = s.rotation
+      flipped = s.flipped
+      crop = s.crop.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h) }
+      muted = s.muted
+      speed = s.speed
+    }
+
+    // The trimmed range within a source of `duration` (clamped; the whole source if the saved
+    // range no longer fits it).
+    func range(in duration: CMTime) -> CMTimeRange {
+      let start = CMTime(value: CMTimeValue(startMs.rounded()), timescale: 1000)
+      let end = CMTimeMinimum(CMTime(value: CMTimeValue(endMs.rounded()), timescale: 1000), duration)
+      guard CMTimeCompare(start, end) < 0 else { return CMTimeRange(start: .zero, duration: duration) }
+      return CMTimeRange(start: start, end: end)
+    }
+
+    // Display size after the edit's rotate + crop, for canvas selection.
+    func editedDisplaySize(_ display: CGSize) -> CGSize {
+      var w = display.width, h = display.height
+      if rotation % 2 != 0 { swap(&w, &h) }
+      if let c = crop { w *= c.width; h *= c.height }
+      return CGSize(width: w, height: h)
+    }
+  }
+
+  // One segment of a passthrough join: a source file, optionally cut to a time range, with or
+  // without its audio.
+  struct JoinSegment {
+    let url: URL
+    var range: CMTimeRange? = nil
+    var includeAudio = true
+  }
+
   // One video + (optionally) one audio track, all clips appended in order. Every segment in a
   // composition track shares ONE preferredTransform — callers must pass the transform that
   // displays ALL inserted clips upright (for selective merges, outliers are pre-rotated into
   // the majority's coded orientation so the majority's transform fits them too).
-  private static func buildComposition(_ urls: [URL], transform: CGAffineTransform, includeAudio: Bool) -> AVMutableComposition? {
+  // A segment's `range` cuts it frame-accurately via edit lists; `includeAudio: false` leaves an
+  // empty stretch in the audio track (plays as silence), the same as an audio-less clip.
+  private static func buildComposition(_ segments: [JoinSegment], transform: CGAffineTransform, includeAudio: Bool) -> AVMutableComposition? {
     let comp = AVMutableComposition()
     guard let v = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { return nil }
     let a = includeAudio ? comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) : nil
     v.preferredTransform = transform
     var cursor = CMTime.zero
-    for u in urls {
-      let asset = AVURLAsset(url: u)
+    for seg in segments {
+      let asset = AVURLAsset(url: seg.url)
       guard let sv = asset.tracks(withMediaType: .video).first else { return nil }
-      let range = CMTimeRange(start: .zero, duration: asset.duration)
+      let range = seg.range ?? CMTimeRange(start: .zero, duration: asset.duration)
       do {
         try v.insertTimeRange(range, of: sv, at: cursor)
-        if let a = a, let sa = asset.tracks(withMediaType: .audio).first {
+        if let a = a, seg.includeAudio, let sa = asset.tracks(withMediaType: .audio).first {
           try a.insertTimeRange(range, of: sa, at: cursor)
         }
       } catch {
         return nil
       }
-      cursor = CMTimeAdd(cursor, asset.duration)
+      cursor = CMTimeAdd(cursor, range.duration)
     }
     return comp
   }
@@ -2021,10 +2160,12 @@ extension VideoTrim {
   // Join clips losslessly and verify the assembled duration against the input sum — assembly
   // bugs (timescale/edit-list surprises) show up as duration drift, and a cheap probe here
   // turns "silent corruption" into "fallback to the safe path".
-  private static func joinWithComposition(_ urls: [URL], transform: CGAffineTransform, outputFile: URL, progress: ((Float) -> Void)? = nil, completion: @escaping (Bool) -> Void) {
+  private static func joinWithComposition(_ segments: [JoinSegment], transform: CGAffineTransform, outputFile: URL, progress: ((Float) -> Void)? = nil, completion: @escaping (Bool) -> Void) {
     var expected = 0.0
-    for u in urls { expected += CMTimeGetSeconds(AVURLAsset(url: u).duration) }
-    guard let comp = buildComposition(urls, transform: transform, includeAudio: true) else {
+    for seg in segments {
+      expected += CMTimeGetSeconds(seg.range?.duration ?? AVURLAsset(url: seg.url).duration)
+    }
+    guard let comp = buildComposition(segments, transform: transform, includeAudio: true) else {
       completion(false)
       return
     }
@@ -2049,7 +2190,7 @@ extension VideoTrim {
     let asset = AVURLAsset(url: input)
     guard endSec > startSec,
           let sv = asset.tracks(withMediaType: .video).first,
-          let comp = buildComposition([input], transform: sv.preferredTransform, includeAudio: !stripAudio) else {
+          let comp = buildComposition([JoinSegment(url: input)], transform: sv.preferredTransform, includeAudio: !stripAudio) else {
       completion(false)
       return
     }
@@ -2075,6 +2216,13 @@ extension VideoTrim {
     }
 
     let inputURLs = urls.map { URL(string: $0) ?? URL(fileURLWithPath: $0) }
+    // Per-clip edits (editor `editState` strings, parallel to `urls`; "" = none), applied in
+    // this one pass so a host can store edits as settings and never bake per-clip files.
+    let editStrings = options["clipEdits"] as? [String] ?? []
+    let edits: [ClipEdit?] = inputURLs.indices.map { i in
+      i < editStrings.count ? ClipEdit(json: editStrings[i]) : nil
+    }
+    let anyRender = edits.contains { $0?.needsRender == true }
 
     // Optional pinned canvas from the caller (e.g. an always-portrait reels app).
     var pinned: TargetFormat? = nil
@@ -2117,14 +2265,19 @@ extension VideoTrim {
     // (1) Fast path: every input shares one format signature (and matches the pinned canvas,
     // if any) → passthrough join. No decode, no encode, I/O-bound. The common case for our own
     // recorder clips, and it scales to any clip count / total length for free.
-    if fastEligible && uniform && pinSatisfied {
+    // Trims and mute ride along (time ranges / no audio segment); any rotate/flip/crop/speed
+    // edit needs a re-encode, so it rules this path out.
+    if fastEligible && uniform && pinSatisfied && !anyRender {
       let transform = AVURLAsset(url: inputURLs[0]).tracks(withMediaType: .video).first?.preferredTransform ?? .identity
-      joinWithComposition(inputURLs, transform: transform, outputFile: outputFile, progress: { p in onProgress(Double(p)) }) { ok in
+      let segments = inputURLs.enumerated().map { i, u in
+        JoinSegment(url: u, range: edits[i]?.range(in: AVURLAsset(url: u).duration), includeAudio: !(edits[i]?.muted ?? false))
+      }
+      joinWithComposition(segments, transform: transform, outputFile: outputFile, progress: { p in onProgress(Double(p)) }) { ok in
         if ok {
           respond(true, false)
         } else {
           NSLog("[merge] passthrough join failed; falling back to concat-filter re-encode")
-          mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
+          mergeWithFilter(inputURLs, edits: edits, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
@@ -2134,20 +2287,22 @@ extension VideoTrim {
     // format, then passthrough-join the set. A draft of recorder clips plus one imported
     // library clip re-encodes just that one clip, not all of them. Any conform/verify/join
     // failure falls back to the full re-encode, so the worst case is exactly the old behavior.
-    if fastEligible {
+    // Rendered edits need a known target to conform into: the pinned canvas. Unpinned, the
+    // dominant geometry would have to account for post-edit sizes, so those go to (3).
+    if fastEligible && (pinned != nil || !anyRender) {
       let clips = infos.compactMap { $0 }
-      mergeSelective(clips, pinned: pinned, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp, onProgress: onProgress) { ok in
+      mergeSelective(clips, edits: edits, pinned: pinned, outputFile: outputFile, cacheDirectory: cacheDirectory, timestamp: timestamp, onProgress: onProgress) { ok in
         if ok {
           respond(false, true)
         } else {
-          mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
+          mergeWithFilter(inputURLs, edits: edits, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
         }
       }
       return
     }
 
-    // (3) Fallback: a clip couldn't be probed / non-mp4 output.
-    mergeWithFilter(inputURLs, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
+    // (3) Fallback: a clip couldn't be probed / non-mp4 output / unpinned rendered edits.
+    mergeWithFilter(inputURLs, edits: edits, pinned: pinned, outputFile: outputFile, onProgress: onProgress, completion: completion)
   }
 
   // Normalized codec family for comparing a conform result against its target ("avc1"/"avc3"
@@ -2176,7 +2331,10 @@ extension VideoTrim {
                     hasAudio: true, audioCodec: a.audioCodec, audioRate: a.audioRate, audioCh: a.audioCh)
   }
 
-  private static func mergeSelective(_ clips: [ClipInfo], pinned: TargetFormat?, outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
+  // `edits` is parallel to `clips`. A clip whose edit needs rendering is always a full conform
+  // (never the target, never audio-only); trim/mute-only clips join as time-ranged segments.
+  private static func mergeSelective(_ clips: [ClipInfo], edits: [ClipEdit?], pinned: TargetFormat?, outputFile: URL, cacheDirectory: URL, timestamp: Int, onProgress: @escaping (Double) -> Void, completion: @escaping (Bool) -> Void) {
+    let renders = clips.indices.map { edits[$0]?.needsRender ?? false }
     let target: ClipInfo
     let targetTransform: CGAffineTransform
     if let pin = pinned {
@@ -2184,7 +2342,7 @@ extension VideoTrim {
       // form — the most frequent matching signature becomes the conform target so the largest
       // subset stays lossless. If NOTHING matches, conform everything into a synthesized
       // coded-upright target (rotation baked, no tag).
-      let candidates = clips.filter { $0.matches(pin) }
+      let candidates = clips.indices.filter { !renders[$0] && clips[$0].matches(pin) }.map { clips[$0] }
       if let first = candidates.first {
         var counts: [String: Int] = [:]
         for c in candidates { counts[c.sig, default: 0] += 1 }
@@ -2251,13 +2409,13 @@ extension VideoTrim {
     let conformBitrate = maxBitrate > 0 ? min(maxBitrate, resCeiling) : resCeiling
     let bitrateStr = "\(max(conformBitrate, 2_000_000))"
 
-    var finalURLs = [URL?](repeating: nil, count: clips.count)
+    var finalSegments = [JoinSegment?](repeating: nil, count: clips.count)
     var tempFiles: [URL] = []
 
     func finish(_ ok: Bool) {
-      if ok, finalURLs.allSatisfy({ $0 != nil }) {
+      if ok, finalSegments.allSatisfy({ $0 != nil }) {
         // Conforms occupy 0…0.85 of the bar; the final passthrough join fills the last 0.85…1.0.
-        joinWithComposition(finalURLs.compactMap { $0 }, transform: targetTransform, outputFile: outputFile, progress: { p in onProgress(0.85 + 0.15 * Double(p)) }) { joined in
+        joinWithComposition(finalSegments.compactMap { $0 }, transform: targetTransform, outputFile: outputFile, progress: { p in onProgress(0.85 + 0.15 * Double(p)) }) { joined in
           for t in tempFiles { try? FileManager.default.removeItem(at: t) }
           completion(joined)
         }
@@ -2268,18 +2426,26 @@ extension VideoTrim {
     }
 
     // Pre-pass (single-threaded): pass through clips already in the target format and collect the
-    // outliers that need a conform. Writing finalURLs/tempFiles here is safe because no conform
+    // outliers that need a conform. Writing finalSegments/tempFiles here is safe because no conform
     // thread has started yet.
+    // A trim/mute-only clip joins through its time range; the range is resolved against the
+    // source, which an audio-only conform keeps frame-for-frame.
+    func joinSegment(_ i: Int, url: URL) -> JoinSegment {
+      JoinSegment(url: url,
+                  range: edits[i]?.range(in: AVURLAsset(url: clips[i].url).duration),
+                  includeAudio: !(edits[i]?.muted ?? false))
+    }
     var outliers: [(index: Int, temp: URL, audioOnly: Bool)] = []
     for (i, c) in clips.enumerated() {
-      if c.sig == target.sig {
-        finalURLs[i] = c.url
+      if !renders[i] && c.sig == target.sig {
+        finalSegments[i] = joinSegment(i, url: c.url)
         continue
       }
       // Audio-only fast path: the video already matches the target (codec family / coded size /
       // rotation / fps) and only the audio token differs, so the conform copies the video stream
       // untouched and just transcodes the audio — no full video re-encode.
-      let audioOnly = codecFamily(c.vcodec) == codecFamily(target.vcodec)
+      let audioOnly = !renders[i]
+        && codecFamily(c.vcodec) == codecFamily(target.vcodec)
         && c.codedW == target.codedW && c.codedH == target.codedH
         && c.rotationDeg == target.rotationDeg && c.fps == target.fps
       let temp = cacheDirectory.appendingPathComponent("\(FILE_PREFIX)_conform_\(timestamp)_\(i).mp4")
@@ -2305,7 +2471,9 @@ extension VideoTrim {
         if abort { break }
         sem.wait()
         group.enter()
-        conform(clips[i], to: target, bitrate: bitrateStr, audioOnly: audioOnly, output: temp) { ok in
+        // A full conform bakes the edit (trim included) into the temp file; an audio-only conform
+        // keeps the source timeline, so its trim/mute still apply at the join.
+        conform(clips[i], to: target, bitrate: bitrateStr, audioOnly: audioOnly, edit: audioOnly ? nil : edits[i], output: temp) { ok in
           // Re-probe and verify the conform landed in the target's coded geometry & codec; any miss
           // aborts selective so a wrong-orientation segment can't slip through. A full conform bakes
           // rotation into the pixels (rotationDeg 0); the audio-only path copies the video and keeps
@@ -2315,7 +2483,7 @@ extension VideoTrim {
              got.codedW == target.codedW, got.codedH == target.codedH,
              got.rotationDeg == wantRot,
              codecFamily(got.vcodec) == codecFamily(target.vcodec) {
-            syncQ.sync { finalURLs[i] = temp }
+            syncQ.sync { finalSegments[i] = audioOnly ? joinSegment(i, url: temp) : JoinSegment(url: temp) }
           } else {
             NSLog("[merge] selective conform failed/verify-mismatch for clip \(i); falling back")
             syncQ.sync { anyFailed = true }
@@ -2346,8 +2514,18 @@ extension VideoTrim {
   // size / rotation / fps), so we copy the video stream untouched and only conform the audio —
   // a near-instant remux instead of a full transcode. The copied video keeps the target's
   // rotation tag (unlike the re-encode, which bakes rotation in and strips the tag).
-  private static func conform(_ clip: ClipInfo, to target: ClipInfo, bitrate: String, audioOnly: Bool, output: URL, completion: @escaping (Bool) -> Void) {
-    var cmds = ["-i", clip.url.path, "-map", "0:v:0"]
+  // With an `edit`, the clip is cut first (input seek; frame-accurate since we re-encode), the
+  // edit's rotate/flip/crop/speed filters run on the autorotated frame ahead of the canvas fit,
+  // audio is retimed (atempo) or dropped (mute).
+  private static func conform(_ clip: ClipInfo, to target: ClipInfo, bitrate: String, audioOnly: Bool, edit: ClipEdit?, output: URL, completion: @escaping (Bool) -> Void) {
+    var cmds: [String] = []
+    if let e = edit {
+      let r = e.range(in: AVURLAsset(url: clip.url).duration)
+      cmds.append(contentsOf: ["-ss", String(format: "%.3f", CMTimeGetSeconds(r.start)),
+                               "-to", String(format: "%.3f", CMTimeGetSeconds(r.end))])
+    }
+    cmds.append(contentsOf: ["-i", clip.url.path, "-map", "0:v:0"])
+    let retimed = edit.map { abs($0.speed - 1.0) > 0.0001 } ?? false
     if audioOnly {
       cmds.append(contentsOf: ["-c:v", "copy"])
     } else {
@@ -2356,13 +2534,20 @@ extension VideoTrim {
       let dispH = (swap ? target.codedW : target.codedH) & ~1
       let isHevc = codecFamily(target.vcodec) == "hevc"
 
-      var filters = [
+      var filters: [String] = []
+      if let e = edit {
+        filters.append(contentsOf: editVideoFilters(
+          rotation: e.rotation, flipped: e.flipped, crop: e.crop,
+          displaySize: displaySize(of: AVURLAsset(url: clip.url)) ?? .zero, speed: e.speed))
+      }
+      filters.append(contentsOf: [
         "scale=\(dispW):\(dispH):force_original_aspect_ratio=decrease",
         "pad=\(dispW):\(dispH):(ow-iw)/2:(oh-ih)/2",
         "setsar=1",
-      ]
+      ])
       // Only resample frame rate when it actually differs — avoids needless frame resampling.
-      if clip.fps != target.fps { filters.append("fps=\(target.fps)") }
+      // A speed change retimes frames, so it always lands back on the target rate.
+      if clip.fps != target.fps || retimed { filters.append("fps=\(target.fps)") }
       filters.append("format=yuv420p")
       switch target.rotationDeg {
       case 90: filters.append("transpose=2")
@@ -2375,8 +2560,10 @@ extension VideoTrim {
                                "-b:v", bitrate])
       if isHevc { cmds.append(contentsOf: ["-tag:v", "hvc1"]) }
     }
-    if target.hasAudio && clip.hasAudio {
-      cmds.append(contentsOf: ["-map", "0:a:0", "-c:a", "aac", "-ar", "\(target.audioRate)", "-ac", "\(target.audioCh)"])
+    if target.hasAudio && clip.hasAudio && !(edit?.muted ?? false) {
+      cmds.append(contentsOf: ["-map", "0:a:0"])
+      if retimed, let e = edit { cmds.append(contentsOf: ["-af", buildAtempoChain(e.speed)]) }
+      cmds.append(contentsOf: ["-c:a", "aac", "-ar", "\(target.audioRate)", "-ac", "\(target.audioCh)"])
     } else {
       cmds.append("-an")
     }
@@ -2389,7 +2576,10 @@ extension VideoTrim {
   // Re-encode concatenation via the concat *filter*. Normalizes every input to the pinned
   // canvas (if any) or the dominant display geometry, so mismatched clips merge correctly
   // (letterboxed). Always writes h264 — this is the safe floor under the smarter paths.
-  private static func mergeWithFilter(_ inputURLs: [URL], pinned: TargetFormat?, outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
+  // `edits` (parallel to `inputURLs`) are applied per input: cut via input seek, rotate/flip/
+  // crop/speed filters ahead of the canvas fit, atempo on the audio leg, mute as a silent leg.
+  // Durations, the dominant canvas and progress all use the edited clips.
+  private static func mergeWithFilter(_ inputURLs: [URL], edits: [ClipEdit?], pinned: TargetFormat?, outputFile: URL, onProgress: @escaping (Double) -> Void, completion: @escaping ([String: Any]) -> Void) {
     let urls = inputURLs.map { $0.absoluteString }
     var cmds: [String] = []
     var maxBitrate: Int = 0
@@ -2397,18 +2587,30 @@ extension VideoTrim {
     var displays: [(w: Int, h: Int, fps: Int)] = []
     var hasAudio: [Bool] = []
     var durationsSec: [Double] = []
-    for urlStr in urls {
+    var editFilters: [[String]] = []
+    for (i, urlStr) in urls.enumerated() {
       let u = URL(string: urlStr) ?? URL(fileURLWithPath: urlStr)
-      cmds.append(contentsOf: ["-i", u.path])
       let asset = AVURLAsset(url: u)
-      let dur = CMTimeGetSeconds(asset.duration)
+      let edit = i < edits.count ? edits[i] : nil
+      var dur = CMTimeGetSeconds(asset.duration)
+      if let e = edit {
+        let r = e.range(in: asset.duration)
+        cmds.append(contentsOf: ["-ss", String(format: "%.3f", CMTimeGetSeconds(r.start)),
+                                 "-to", String(format: "%.3f", CMTimeGetSeconds(r.end))])
+        dur = CMTimeGetSeconds(r.duration) / e.speed
+      }
+      cmds.append(contentsOf: ["-i", u.path])
       durationsSec.append(dur)
       totalMs += dur * 1000
-      hasAudio.append(!asset.tracks(withMediaType: .audio).isEmpty)
+      hasAudio.append(!asset.tracks(withMediaType: .audio).isEmpty && !(edit?.muted ?? false))
+      let display = displaySize(of: asset) ?? .zero
+      editFilters.append(edit.map {
+        editVideoFilters(rotation: $0.rotation, flipped: $0.flipped, crop: $0.crop, displaySize: display, speed: $0.speed)
+      } ?? [])
       if let track = asset.tracks(withMediaType: .video).first {
         maxBitrate = max(maxBitrate, Int(track.estimatedDataRate))
-        let size = track.naturalSize.applying(track.preferredTransform)
-        displays.append((w: Int(abs(size.width)), h: Int(abs(size.height)), fps: Int(ceil(track.nominalFrameRate))))
+        let size = edit?.editedDisplaySize(display) ?? display
+        displays.append((w: Int(size.width) & ~1, h: Int(size.height) & ~1, fps: Int(ceil(track.nominalFrameRate))))
       }
     }
     let bitrateStr = maxBitrate > 0 ? "\(maxBitrate)" : "10M"
@@ -2461,13 +2663,22 @@ extension VideoTrim {
     let scaleFilter = "scale=\(targetW):\(targetH):force_original_aspect_ratio=decrease,pad=\(targetW):\(targetH):(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=\(targetFps)"
     var scaleParts: [String] = []
     for i in 0..<n {
-      scaleParts.append("[\(i):v:0]\(scaleFilter)[v\(i)]")
+      let chain = (editFilters[i] + [scaleFilter]).joined(separator: ",")
+      scaleParts.append("[\(i):v:0]\(chain)[v\(i)]")
     }
 
     let filterComplex: String
     let mapArgs: [String]
     if anyAudio {
-      let audioParts = (0..<n).map { "[\(audioSrcIndex[$0]):a:0]aformat=sample_rates=48000:channel_layouts=stereo[a\($0)]" }.joined(separator: ";")
+      // Real audio legs of sped-up clips are retimed; synthesized silence is already the
+      // edited length.
+      let audioParts = (0..<n).map { i -> String in
+        var tempo = ""
+        if hasAudio[i], i < edits.count, let e = edits[i], abs(e.speed - 1.0) > 0.0001 {
+          tempo = buildAtempoChain(e.speed) + ","
+        }
+        return "[\(audioSrcIndex[i]):a:0]\(tempo)aformat=sample_rates=48000:channel_layouts=stereo[a\(i)]"
+      }.joined(separator: ";")
       let concatInputs = (0..<n).map { "[v\($0)][a\($0)]" }.joined()
       filterComplex = scaleParts.joined(separator: ";") + ";" + audioParts + ";" + concatInputs + "concat=n=\(n):v=1:a=1[outv][outa]"
       mapArgs = ["-map", "[outv]", "-map", "[outa]"]

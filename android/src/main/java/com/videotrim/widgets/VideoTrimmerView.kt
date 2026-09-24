@@ -41,8 +41,10 @@ import android.widget.TextView
 
 import androidx.appcompat.app.AlertDialog
 
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.WritableMap
 import com.facebook.react.bridge.UiThreadUtil.runOnUiThread
 import com.videotrim.R
 import com.videotrim.enums.ErrorCode
@@ -789,6 +791,20 @@ class VideoTrimmerView(
     cropBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
     undoBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
     redoBtn.setColorFilter(dimmedIconColor, android.graphics.PorterDuff.Mode.SRC_IN)
+  }
+
+  /**
+   * `renderOnSave: false`: pause and return the session as settings for `onSaveEditState`
+   * (times in ms; `duration` is the timeline length `(end - start) / speed`). Nothing is encoded.
+   */
+  fun captureEditState(): WritableMap {
+    onMediaPause()
+    return Arguments.createMap().apply {
+      putString("editState", serializeEditState())
+      putDouble("startTime", startTime.toDouble())
+      putDouble("endTime", endTime.toDouble())
+      putDouble("duration", Math.round((endTime - startTime) / speed).toDouble())
+    }
   }
 
   fun onSaveClicked() {

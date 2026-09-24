@@ -13,6 +13,7 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -50,6 +51,7 @@ import com.videotrim.enums.ErrorCode
 import com.videotrim.interfaces.VideoTrimListener
 import com.videotrim.utils.MediaMetadataUtil
 import com.videotrim.utils.StorageUtil
+import com.videotrim.utils.TrimEditState
 import com.videotrim.utils.VideoTrimmerUtil
 import com.videotrim.widgets.VideoTrimmerView
 import iknow.android.utils.BaseUtils
@@ -481,6 +483,13 @@ open class BaseVideoTrimModule internal constructor(
   }
 
   private fun startTrim() {
+    // renderOnSave: false — hand the session back as settings and close; nothing is encoded.
+    val config = editorConfig
+    if (config?.hasKey("renderOnSave") == true && !config.getBoolean("renderOnSave")) {
+      trimmerView?.captureEditState()?.let { sendEvent("onSaveEditState", it) }
+      hideDialog(true)
+      return
+    }
     val activity = reactApplicationContext.currentActivity ?: return
     // Create the parent layout for the dialog
     val layout = LinearLayout(activity)
@@ -814,6 +823,29 @@ open class BaseVideoTrimModule internal constructor(
   // extract high-res HEVC frames. When MediaMetadataRetriever still can't produce a
   // bitmap (budget-device decoder limits), falls back to FFmpeg's software decoder,
   // which is already bundled for trimming and has no such hardware constraints.
+  /**
+   * An upright frame rendered as an edit would render it: turned counter-clockwise `rotation`
+   * quarter turns, then mirrored, then cropped (normalized to the rotated frame) — the same order
+   * as VideoTrimmerUtil.buildEditFilters.
+   */
+  private fun applyEdit(src: Bitmap, edit: TrimEditState): Bitmap {
+    var bmp = src
+    if (edit.rotation != 0 || edit.flipped) {
+      val m = android.graphics.Matrix()
+      m.postRotate(-90f * edit.rotation) // Android's positive angle is clockwise.
+      if (edit.flipped) m.postScale(-1f, 1f)
+      bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+    }
+    edit.crop?.let { c ->
+      val x = (c.x * bmp.width).toInt().coerceIn(0, bmp.width - 1)
+      val y = (c.y * bmp.height).toInt().coerceIn(0, bmp.height - 1)
+      val w = (c.w * bmp.width).toInt().coerceIn(1, bmp.width - x)
+      val h = (c.h * bmp.height).toInt().coerceIn(1, bmp.height - y)
+      bmp = Bitmap.createBitmap(bmp, x, y, w, h)
+    }
+    return bmp
+  }
+
   fun getFrameAt(url: String, options: ReadableMap?, promise: Promise) {
     Thread {
       try {
@@ -822,6 +854,9 @@ open class BaseVideoTrimModule internal constructor(
         val quality = options?.getInt("quality") ?: 80
         val maxWidth = options?.getInt("maxWidth") ?: -1
         val maxHeight = options?.getInt("maxHeight") ?: -1
+        val edit = if (options?.hasKey("editState") == true) {
+          options.getString("editState")?.let { TrimEditState.fromJson(it) }
+        } else null
 
         val retriever = MediaMetadataUtil.getMediaMetadataRetriever(url)
         if (retriever == null) {
@@ -835,7 +870,9 @@ open class BaseVideoTrimModule internal constructor(
         // Decode target: the video's native size shrunk to fit maxWidth/maxHeight (never upscaled).
         var decodeW = videoWidth
         var decodeH = videoHeight
-        if (videoWidth > 0 && videoHeight > 0 && (maxWidth > 0 || maxHeight > 0)) {
+        // With an edit, decode at full size: the crop would otherwise cut into an already-shrunk
+        // frame. The edited bitmap is scaled to maxWidth/maxHeight below.
+        if (edit == null && videoWidth > 0 && videoHeight > 0 && (maxWidth > 0 || maxHeight > 0)) {
           val ratioW = if (maxWidth > 0) maxWidth.toFloat() / videoWidth else 1f
           val ratioH = if (maxHeight > 0) maxHeight.toFloat() / videoHeight else 1f
           val ratio = min(min(ratioW, ratioH), 1f)
@@ -862,6 +899,10 @@ open class BaseVideoTrimModule internal constructor(
         if (bitmap == null) {
           UiThreadUtil.runOnUiThread { promise.reject(Exception("Failed to extract frame")) }
           return@Thread
+        }
+
+        if (edit != null) {
+          bitmap = applyEdit(bitmap, edit)
         }
 
         if (maxWidth > 0 || maxHeight > 0) {
@@ -1296,6 +1337,17 @@ open class BaseVideoTrimModule internal constructor(
       return
     }
 
+    // Per-clip edits (editor `editState` strings, parallel to `urls`; "" = none), applied in this
+    // one pass — cut via input seek, rotate/flip/crop/speed filters ahead of the canvas fit,
+    // atempo on the audio leg, mute as a silent leg — so a host can store edits as settings and
+    // never bake per-clip files. Durations and the dominant canvas use the edited clips.
+    val clipEdits = if (options != null && options.hasKey("clipEdits")) options.getArray("clipEdits") else null
+    val edits = (0 until n).map { i ->
+      val json = if (clipEdits != null && i < clipEdits.size()) clipEdits.getString(i) else null
+      json?.takeIf { it.isNotEmpty() }?.let { TrimEditState.fromJson(it) }
+    }
+    val editFilters = arrayOfNulls<List<String>>(n)
+
     val inputArgs = mutableListOf<String>()
     var maxBitrate = 0L
     var totalDurationMs = 0
@@ -1305,15 +1357,13 @@ open class BaseVideoTrimModule internal constructor(
     val sigs = arrayOfNulls<String>(n)
     for (i in 0 until n) {
       val urlStr = urls.getString(i) ?: continue
-      inputArgs.addAll(listOf("-i", urlStr))
+      var dur = 0
       try {
         val retriever = MediaMetadataRetriever()
         retriever.setDataSource(reactApplicationContext, Uri.parse(urlStr))
         val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
         if (bitrate > maxBitrate) maxBitrate = bitrate
-        val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0
-        durationsMs[i] = dur
-        totalDurationMs += dur
+        dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0
         hasAudio[i] = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
         retriever.release()
       } catch (_: Exception) {}
@@ -1325,7 +1375,35 @@ open class BaseVideoTrimModule internal constructor(
       // reads the display matrix, so its dims+rotation stay consistent with the scaler.
       val disp = probeDisplaySize(urlStr)
       Log.d(TAG, "merge probe[$i]: FFprobe display=$disp")
-      if (disp != null) sigs[i] = "${disp.first}x${disp.second}"
+      var geom = disp
+      val edit = edits[i]
+      if (edit != null) {
+        // The saved range, clamped to the source (the whole source if it no longer fits).
+        val end = if (dur > 0) minOf(edit.endMs, dur.toLong()) else edit.endMs
+        val start = if (edit.startMs < end) edit.startMs else 0L
+        val stop = if (edit.startMs < end) end else dur.toLong()
+        if (stop > start) {
+          inputArgs.addAll(listOf("-ss", "${start}ms", "-to", "${stop}ms"))
+          dur = Math.round((stop - start) / edit.speed).toInt()
+        }
+        if (edit.muted) hasAudio[i] = false
+        val crop = edit.crop?.let {
+          RectF(it.x.toFloat(), it.y.toFloat(), (it.x + it.w).toFloat(), (it.y + it.h).toFloat())
+        }
+        editFilters[i] = VideoTrimmerUtil.buildEditFilters(
+          edit.rotation, edit.flipped, crop, disp?.first ?: 0, disp?.second ?: 0, edit.speed
+        )
+        if (disp != null) {
+          var w = disp.first.toDouble(); var h = disp.second.toDouble()
+          if (edit.rotation % 2 != 0) { val t = w; w = h; h = t }
+          edit.crop?.let { w *= it.w; h *= it.h }
+          geom = (w.toInt() and 1.inv()) to (h.toInt() and 1.inv())
+        }
+      }
+      inputArgs.addAll(listOf("-i", urlStr))
+      durationsMs[i] = dur
+      totalDurationMs += dur
+      if (geom != null) sigs[i] = "${geom.first}x${geom.second}"
     }
     val bitrateStr = if (maxBitrate > 0) "$maxBitrate" else "10M"
 
@@ -1402,15 +1480,22 @@ open class BaseVideoTrimModule internal constructor(
       // before concat. The fps filter prevents massive frame duplication when inputs have
       // very different frame rates (e.g. 24fps + 60fps would cause thousands of dupes).
       val scaleFilter = "scale=$outW:$outH:force_original_aspect_ratio=decrease,pad=$outW:$outH:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps=$targetFps"
-      val scaleParts = (0 until n).joinToString(";") { "[$it:v:0]${scaleFilter}[v$it]" }
+      val scaleParts = (0 until n).joinToString(";") {
+        val chain = ((editFilters[it] ?: emptyList()) + scaleFilter).joinToString(",")
+        "[$it:v:0]$chain[v$it]"
+      }
 
       // Inputs may lack audio: silent anullsrc tracks were appended (audioSrcIndex) so every
       // input has an audio stream to concat. When NONE has audio, concat video-only.
       val filterComplex: String
       val mapArgs: List<String>
       if (anyAudio) {
+        // Real audio legs of sped-up clips are retimed; synthesized silence is already the
+        // edited length.
         val audioParts = (0 until n).joinToString(";") {
-          "[${audioSrcIndex[it]}:a:0]aformat=sample_rates=48000:channel_layouts=mono[a$it]"
+          val speed = edits[it]?.speed ?: 1.0
+          val tempo = if (hasAudio[it] && speed != 1.0) VideoTrimmerUtil.buildAtempoChain(speed) + "," else ""
+          "[${audioSrcIndex[it]}:a:0]${tempo}aformat=sample_rates=48000:channel_layouts=mono[a$it]"
         }
         val concatInputs = (0 until n).joinToString("") { "[v$it][a$it]" }
         filterComplex = "$scaleParts;$audioParts;${concatInputs}concat=n=$n:v=1:a=1[outv][outa]"
