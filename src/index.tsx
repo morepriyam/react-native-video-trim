@@ -402,7 +402,9 @@ export function merge(
     throw new Error('URLs array cannot be empty!');
   }
   if (options.clipEdits && options.clipEdits.length !== urls.length) {
-    throw new Error('clipEdits must have one entry per URL (use "" for no edit)');
+    throw new Error(
+      'clipEdits must have one entry per URL (use "" for no edit)'
+    );
   }
   return VideoTrim.merge(urls, createMergeOptions(options));
 }
