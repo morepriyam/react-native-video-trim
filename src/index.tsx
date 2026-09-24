@@ -133,6 +133,7 @@ function createEditorConfig(
     removeAfterFailedToShare: false,
     cancelButtonText: 'Cancel',
     saveButtonText: 'Save',
+    renderOnSave: true,
     enableDeleteButton: false,
     enableDeleteDialog: true,
     deleteDialogTitle: 'Delete?',
@@ -399,6 +400,11 @@ export function merge(
 ): Promise<MergeResult> {
   if (!urls?.length) {
     throw new Error('URLs array cannot be empty!');
+  }
+  if (options.clipEdits && options.clipEdits.length !== urls.length) {
+    throw new Error(
+      'clipEdits must have one entry per URL (use "" for no edit)'
+    );
   }
   return VideoTrim.merge(urls, createMergeOptions(options));
 }

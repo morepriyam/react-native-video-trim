@@ -148,6 +148,7 @@ RCT_EXPORT_MODULE()
   dict[@"enablePreciseTrimming"] = @(config.enablePreciseTrimming());
   dict[@"removeAudio"] = @(config.removeAudio());
   dict[@"speed"] = @(config.speed());
+  dict[@"renderOnSave"] = @(config.renderOnSave());
   dict[@"enableDeleteButton"] = @(config.enableDeleteButton());
   dict[@"enableDeleteDialog"] = @(config.enableDeleteDialog());
   dict[@"deleteDialogTitle"] = config.deleteDialogTitle();
@@ -233,6 +234,10 @@ RCT_EXPORT_MODULE()
   dict[@"quality"] = @(options.quality());
   dict[@"maxWidth"] = @(options.maxWidth());
   dict[@"maxHeight"] = @(options.maxHeight());
+  NSString *frameEditState = options.editState();
+  if (frameEditState != nil) {
+    dict[@"editState"] = frameEditState;
+  }
 
   [VideoTrimSwift getFrameAt:url options:dict completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
     if (result[@"error"]) {
@@ -327,6 +332,14 @@ RCT_EXPORT_MODULE()
   if (options.targetHeight().has_value()) dict[@"targetHeight"] = @(options.targetHeight().value());
   if (options.targetFps().has_value()) dict[@"targetFps"] = @(options.targetFps().value());
   if (options.targetCodec()) dict[@"targetCodec"] = options.targetCodec();
+  auto clipEditsOpt = options.clipEdits();
+  if (clipEditsOpt.has_value()) {
+    NSMutableArray *clipEdits = [NSMutableArray array];
+    for (NSString *clipEdit : clipEditsOpt.value()) {
+      [clipEdits addObject:clipEdit ?: @""];
+    }
+    dict[@"clipEdits"] = clipEdits;
+  }
 
   [VideoTrimSwift merge:urls options:dict onProgress:^(double p) {
     [self emitOnMergeProgress:@{ @"progress": @(p) }];
@@ -419,6 +432,8 @@ RCT_EXPORT_MODULE()
     [self emitOnCancel];
   } else if ([eventName isEqualToString:@"onDelete"]) {
     [self emitOnDelete];
+  } else if ([eventName isEqualToString:@"onSaveEditState"]) {
+    [self emitOnSaveEditState:body];
   } else if ([eventName isEqualToString:@"onHide"]) {
     [self emitOnHide];
   } else if ([eventName isEqualToString:@"onShow"]) {

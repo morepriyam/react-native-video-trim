@@ -118,6 +118,13 @@ export interface EditorConfig extends BaseOptions {
    * host decides what deleting means. Video only. Default `false`.
    */
   enableDeleteButton: boolean;
+  /**
+   * When `false`, Save does not encode anything: the editor emits `onSaveEditState`
+   * with the session's `editState` and closes immediately (no progress dialog, no
+   * `onStartTrimming` / `onFinishTrimming`). For hosts that store the edit as
+   * settings and render later — e.g. via `merge()`'s `clipEdits`. Default `true`.
+   */
+  renderOnSave: boolean;
   /** Whether to confirm before emitting `onDelete`. Default `true`. */
   enableDeleteDialog: boolean;
   /** Title of the delete confirmation dialog. */
@@ -257,6 +264,12 @@ export interface FrameExtractionOptions {
   maxWidth: number;
   /** Maximum height in pixels. Width is auto-calculated to preserve aspect ratio. `-1` for original. */
   maxHeight: number;
+  /**
+   * An editor `editState`: the frame is rotated, flipped and cropped as that edit
+   * would render it (before `maxWidth` / `maxHeight` apply), e.g. for a cover that
+   * matches an edited clip. `time` is still used as given — pass the edit's start.
+   */
+  editState?: string;
 }
 
 /**
@@ -436,6 +449,15 @@ export interface MergeOptions {
    * (The full re-encode fallback path always writes h264.)
    */
   targetCodec?: string;
+  /**
+   * Per-clip edits, parallel to `urls`: each entry is an editor `editState` string
+   * (from `onSaveEditState` / `onFinishTrimming`), or `""` for no edit. Each clip is
+   * cut to its trim range, rotated / flipped / cropped, retimed and muted as saved,
+   * inside this one merge — so a host can keep edits as settings and never bake a
+   * per-clip file. Trim- and mute-only clips can still join without re-encoding;
+   * rotate / flip / crop / speed re-encode that clip. Malformed entries are ignored.
+   */
+  clipEdits?: ReadonlyArray<string>;
 }
 
 /**
@@ -592,6 +614,20 @@ export interface Spec extends TurboModule {
   readonly onCancel: EventEmitter<void>;
   /** Emitted when the user deletes from the editor (`enableDeleteButton`); the editor closes. */
   readonly onDelete: EventEmitter<void>;
+  /**
+   * Emitted instead of trimming when Save is tapped with `renderOnSave: false`; the
+   * editor closes. All times are in milliseconds.
+   */
+  readonly onSaveEditState: EventEmitter<{
+    /** The session's settings and undo/redo history (see `EditorConfig.editState`). */
+    editState: string;
+    /** Start of the selected range in the source. */
+    startTime: number;
+    /** End of the selected range in the source. */
+    endTime: number;
+    /** Length of the edited clip on a timeline: `(endTime - startTime) / speed`. */
+    duration: number;
+  }>;
   /** Emitted when the editor is hidden. */
   readonly onHide: EventEmitter<void>;
   /** Emitted when the editor is shown. */

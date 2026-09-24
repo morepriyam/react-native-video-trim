@@ -66,6 +66,49 @@ object VideoTrimmerUtil {
   @JvmField val THUMB_WIDTH = UnitConverter.dpToPx(25)
   private const val THUMB_RESOLUTION_RES = 2
 
+  /**
+   * FFmpeg video filters for a user edit — rotate (counter-clockwise quarter turns), flip, crop
+   * (normalized to the displayed frame after rotate/flip) and speed — in the order the editor
+   * applies them, on FFmpeg's autorotated input (`dispW`/`dispH` = the source's display size).
+   * Shared by the editor's trim and by merge's per-clip edits.
+   */
+  internal fun buildEditFilters(
+    rotation: Int,
+    flipped: Boolean,
+    crop: RectF?,
+    dispW: Int,
+    dispH: Int,
+    speed: Double
+  ): List<String> {
+    val filters = mutableListOf<String>()
+    when (rotation) {
+      1 -> filters.add("transpose=2")
+      2 -> { filters.add("transpose=2"); filters.add("transpose=2") }
+      3 -> filters.add("transpose=1")
+    }
+    if (flipped) {
+      filters.add("hflip")
+    }
+    // Convert normalized crop rect [0..1] to pixel coordinates in the post-rotation frame.
+    if (crop != null && dispW > 0 && dispH > 0) {
+      // After 90°/270° rotation the width and height are swapped.
+      val postW = if (rotation % 2 != 0) dispH else dispW
+      val postH = if (rotation % 2 != 0) dispW else dispH
+      val cx = (crop.left * postW).roundToInt()
+      val cy = (crop.top * postH).roundToInt()
+      // H.264 requires even dimensions; round down to nearest even number.
+      val cw = (crop.width() * postW).roundToInt() and 1.inv()
+      val ch = (crop.height() * postH).roundToInt() and 1.inv()
+      if (cw > 0 && ch > 0) {
+        filters.add("crop=$cw:$ch:$cx:$cy")
+      }
+    }
+    if (speed != 1.0) {
+      filters.add("setpts=${1.0 / speed}*PTS")
+    }
+    return filters
+  }
+
   internal fun buildAtempoChain(speed: Double): String {
     var remaining = speed
     val filters = mutableListOf<String>()
@@ -469,39 +512,7 @@ object VideoTrimmerUtil {
     }
 
     // Build the video filters once. They're encoder-independent.
-    val videoFilters = mutableListOf<String>()
-    when (userRotationCount) {
-      1 -> videoFilters.add("transpose=2")
-      2 -> { videoFilters.add("transpose=2"); videoFilters.add("transpose=2") }
-      3 -> videoFilters.add("transpose=1")
-    }
-    if (userIsFlipped) {
-      videoFilters.add("hflip")
-    }
-    // Convert normalized crop rect [0..1] to pixel coordinates in the post-rotation frame.
-    if (cropNormalized != null && videoWidth > 0 && videoHeight > 0) {
-      val postW: Int
-      val postH: Int
-      // After 90°/270° rotation the width and height are swapped.
-      if (userRotationCount % 2 != 0) {
-        postW = videoHeight; postH = videoWidth
-      } else {
-        postW = videoWidth; postH = videoHeight
-      }
-      val cx = (cropNormalized.left * postW).roundToInt()
-      val cy = (cropNormalized.top * postH).roundToInt()
-      var cw = (cropNormalized.width() * postW).roundToInt()
-      var ch = (cropNormalized.height() * postH).roundToInt()
-      // H.264 requires even dimensions; round down to nearest even number.
-      cw = cw and 1.inv()
-      ch = ch and 1.inv()
-      if (cw > 0 && ch > 0) {
-        videoFilters.add("crop=$cw:$ch:$cx:$cy")
-      }
-    }
-    if (speed != 1.0) {
-      videoFilters.add("setpts=${1.0 / speed}*PTS")
-    }
+    val videoFilters = buildEditFilters(userRotationCount, userIsFlipped, cropNormalized, videoWidth, videoHeight, speed)
 
     // Preserve source quality by matching the original bitrate. Falls back to 10 Mbps.
     val bitrateStr = if (videoBitrate > 0) "$videoBitrate" else "10M"
