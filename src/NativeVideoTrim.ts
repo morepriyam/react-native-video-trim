@@ -96,6 +96,38 @@ export interface EditorConfig extends BaseOptions {
   autoplay: boolean;
   /** Position in milliseconds to seek to when the editor loads. Set to `-1` to disable. */
   jumpToPositionOnLoad: number;
+  /**
+   * Restore a previous editing session: the `editState` string from an earlier
+   * `onFinishTrimming` event for the same source file. The editor opens with that
+   * trim range, rotation, flip, crop, mute and speed already applied, and with the
+   * session's undo/redo history (which covers all of those). Mute and speed here
+   * override `removeAudio` / `speed` for the editor UI. Treat the string as opaque — its JSON shape is versioned internally
+   * and unknown or malformed values are ignored.
+   */
+  editState?: string;
+  /**
+   * Speeds offered by the editor's speed menu, in the order shown (each 0.25–4.0).
+   * Defaults to `[0.25, 0.5, 1, 1.5, 2, 3, 4]`. The menu always ends with a
+   * "Custom…" entry for any other speed in that range, and a current speed that is
+   * not in the list (custom, or restored via `editState`) is listed and checked too.
+   */
+  speedOptions?: ReadonlyArray<number>;
+  /**
+   * Show a delete (trash) button in the edit toolbar. Tapping it (after the
+   * confirmation dialog, if enabled) closes the editor and emits `onDelete`; the
+   * host decides what deleting means. Video only. Default `false`.
+   */
+  enableDeleteButton: boolean;
+  /** Whether to confirm before emitting `onDelete`. Default `true`. */
+  enableDeleteDialog: boolean;
+  /** Title of the delete confirmation dialog. */
+  deleteDialogTitle: string;
+  /** Message of the delete confirmation dialog. */
+  deleteDialogMessage: string;
+  /** Text for the dismiss button in the delete confirmation dialog. */
+  deleteDialogCancelText: string;
+  /** Text for the (destructive) confirm button in the delete confirmation dialog. */
+  deleteDialogConfirmText: string;
   /** Whether to automatically close the editor when trimming finishes. */
   closeWhenFinish: boolean;
   /** Whether to allow the user to cancel an in-progress trim operation. */
@@ -558,6 +590,8 @@ export interface Spec extends TurboModule {
   readonly onCancelTrimming: EventEmitter<void>;
   /** Emitted when the user dismisses the editor without trimming. */
   readonly onCancel: EventEmitter<void>;
+  /** Emitted when the user deletes from the editor (`enableDeleteButton`); the editor closes. */
+  readonly onDelete: EventEmitter<void>;
   /** Emitted when the editor is hidden. */
   readonly onHide: EventEmitter<void>;
   /** Emitted when the editor is shown. */
@@ -572,6 +606,13 @@ export interface Spec extends TurboModule {
     endTime: number;
     /** Duration of the trimmed clip in milliseconds. */
     duration: number;
+    /**
+     * Opaque snapshot of the editor settings that produced this output (trim range,
+     * rotation, flip, crop, mute, speed) plus the undo/redo history. Persist it and pass it back as
+     * `EditorConfig.editState` with the same source file to reopen the editor where
+     * the user left off.
+     */
+    editState?: string;
   }>;
   /** Emitted with FFmpeg log output during trimming. */
   readonly onLog: EventEmitter<{

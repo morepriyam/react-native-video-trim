@@ -348,6 +348,7 @@ open class BaseVideoTrimModule internal constructor(
     map.putInt("duration", duration)
     map.putDouble("startTime", startTime.toDouble())
     map.putDouble("endTime", endTime.toDouble())
+    trimmerView?.savedEditState?.let { map.putString("editState", it) }
     sendEvent("onFinishTrimming", map)
 
     if (editorConfig?.getBoolean("saveToPhoto") == true && isVideoType) {
@@ -415,6 +416,36 @@ open class BaseVideoTrimModule internal constructor(
     }
     val alertDialog = builder.create()
     alertDialog.show()
+  }
+
+  override fun onDelete() {
+    val delete = {
+      sendEvent("onDelete", null)
+      hideDialog(true)
+    }
+    val config = editorConfig
+    if (config?.hasKey("enableDeleteDialog") == true && !config.getBoolean("enableDeleteDialog")) {
+      delete()
+      return
+    }
+
+    fun text(key: String, fallback: String): String =
+      if (config?.hasKey(key) == true) config.getString(key) ?: fallback else fallback
+
+    val activity = reactApplicationContext.currentActivity ?: return
+    AlertDialog.Builder(activity)
+      .setTitle(text("deleteDialogTitle", "Delete?"))
+      .setMessage(text("deleteDialogMessage", "This cannot be undone."))
+      .setCancelable(false)
+      .setPositiveButton(text("deleteDialogConfirmText", "Delete")) { dialog: DialogInterface, _: Int ->
+        dialog.cancel()
+        delete()
+      }
+      .setNegativeButton(text("deleteDialogCancelText", "Cancel")) { dialog: DialogInterface, _: Int ->
+        dialog.cancel()
+      }
+      .create()
+      .show()
   }
 
   override fun onSave() {

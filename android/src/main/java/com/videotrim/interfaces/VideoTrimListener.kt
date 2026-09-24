@@ -10,6 +10,7 @@ interface VideoTrimListener {
   fun onCancelTrim()
   fun onError(errorMessage: String?, errorCode: ErrorCode)
   fun onCancel()
+  fun onDelete()
   fun onSave()
   fun onLog(log: WritableMap)
   fun onStatistics(statistics: WritableMap)
