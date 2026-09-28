@@ -346,6 +346,26 @@ export interface CompressOptions {
    * canvas). Default `false`.
    */
   letterbox: boolean;
+  /**
+   * Which engine re-encodes: `"ffmpeg"` (default) or `"auto"`. On iOS, `"auto"` runs the
+   * native AVFoundation engine first — hardware decode + encode, GPU scaling, and real
+   * HDR→SDR tone mapping (HLG, PQ, Dolby Vision) — and falls back to FFmpeg for anything
+   * AVFoundation can't read. It applies to `letterbox` canvas conforms and `copyVideo`
+   * audio conforms to MP4 without `removeAudio`; everything else (and Android) uses FFmpeg.
+   */
+  engine: string;
+  /**
+   * Rotation tag for the output, in {@link Spec.probeVideo}'s convention (display-matrix
+   * degrees: `0`, `90`, `180`, `270`). With `letterbox`, `width`×`height` is the DISPLAY
+   * canvas and the pixels are written in the rotated coded orientation under this tag — the
+   * layout camera recorders use for portrait. Default `0` (upright coded pixels).
+   */
+  rotation: number;
+  /**
+   * Tone-map an HDR source (HLG/PQ transfer) to SDR BT.709 on the FFmpeg path. The native
+   * engine always renders SDR BT.709. Default `false`.
+   */
+  hdrToSdr: boolean;
 }
 
 /**
@@ -354,6 +374,15 @@ export interface CompressOptions {
 export interface CompressResult {
   /** Absolute path to the compressed output file. */
   outputPath: string;
+  /** Engine that produced the output: `"avfoundation"` or `"ffmpeg"`. */
+  engine: string;
+  /** Why `"auto"` fell back to FFmpeg (the native error); `""` when it didn't. */
+  fallbackReason: string;
+  /**
+   * `true` when no engine could decode the source's audio and the output was written
+   * without it (the video is intact). Callers decide whether a silent clip is acceptable.
+   */
+  audioDropped: boolean;
 }
 
 /**
@@ -376,6 +405,11 @@ export interface VideoProbeResult {
    * fallback to the legacy `rotate` tag.
    */
   rotation: number;
+  /**
+   * `true` when the display matrix also MIRRORS the frame (negative determinant) — e.g. some
+   * front-camera exports. {@link rotation} alone can't express that.
+   */
+  mirrored: boolean;
   /** Nominal (container-declared) frame rate, e.g. `29.97`. `-1` if unknown. */
   nominalFps: number;
   /**
@@ -402,6 +436,11 @@ export interface VideoProbeResult {
   audioChannels: number;
   /** Container duration in milliseconds. `-1` if unknown. */
   duration: number;
+  /**
+   * Duration of the video stream itself in milliseconds (the container's can be longer when
+   * audio outlasts the picture). `-1` if unknown.
+   */
+  videoDuration: number;
   /** File size in bytes. `-1` if unknown. */
   fileSize: number;
 }
