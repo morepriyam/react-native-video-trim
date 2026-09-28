@@ -620,6 +620,12 @@ export interface Spec extends TurboModule {
   ): Promise<ExtractAudioResult>;
   /** Compress a video file to reduce its size. */
   compress(url: string, options: CompressOptions): Promise<CompressResult>;
+  /**
+   * Cancel every in-flight {@link compress} (merges, trims and other jobs are untouched). Each
+   * cancelled call rejects promptly with "Compression cancelled": no fallback engine or retry
+   * runs, and its partial output is deleted.
+   */
+  cancelCompress(): void;
   /** Probe a local media file's container and stream metadata via FFprobe. */
   probeVideo(url: string): Promise<VideoProbeResult>;
   /** Convert a video segment to an animated GIF. */

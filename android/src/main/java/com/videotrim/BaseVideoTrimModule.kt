@@ -53,6 +53,7 @@ import com.videotrim.utils.ConformArgs
 import com.videotrim.utils.MediaMetadataUtil
 import com.videotrim.utils.StorageUtil
 import com.videotrim.utils.TrimEditState
+import com.videotrim.utils.TrimSession
 import com.videotrim.utils.VideoTrimmerUtil
 import com.videotrim.widgets.VideoTrimmerView
 import iknow.android.utils.BaseUtils
@@ -1019,6 +1020,27 @@ open class BaseVideoTrimModule internal constructor(
   // Routed through VideoTrimmerUtil.executeWithEncoderFallback so the encoder
   // fallback chain (h264_mediacodec → mpeg4) covers this path too — see README's
   // "Android encoder compatibility" section.
+  /** One in-flight `compress` call (see [cancelCompress]); a cancelled one never retries. */
+  private class CompressJob {
+    @Volatile var cancelled = false
+    @Volatile var session: TrimSession? = null
+    fun cancel() {
+      cancelled = true
+      session?.cancel()
+    }
+  }
+
+  private val compressJobs = java.util.Collections.synchronizedSet(mutableSetOf<CompressJob>())
+
+  /**
+   * Cancel every in-flight `compress` (merges, trims and other jobs are untouched). Each one
+   * rejects promptly with "Compression cancelled", its partial output deleted.
+   */
+  fun cancelCompress() {
+    val jobs = synchronized(compressJobs) { compressJobs.toList() }
+    jobs.forEach { it.cancel() }
+  }
+
   fun compress(url: String, options: ReadableMap?, promise: Promise) {
     val quality = options?.getString("quality") ?: "medium"
     val bitrate = options?.getDouble("bitrate") ?: -1.0
@@ -1057,6 +1079,21 @@ open class BaseVideoTrimModule internal constructor(
       else -> VideoTrimmerUtil.reEncodeEncoderConfigs(bitrateStr)
     }
 
+    val job = CompressJob()
+    compressJobs.add(job)
+    fun resolve(result: WritableMap) {
+      compressJobs.remove(job)
+      promise.resolve(result)
+    }
+    fun reject(e: Exception) {
+      compressJobs.remove(job)
+      promise.reject(e)
+    }
+    fun rejectCancelled() {
+      File(outputFile).delete()
+      reject(Exception("Compression cancelled"))
+    }
+
     // FFprobe blocks: read the source's display matrix off the JS thread (mirrored sources are
     // oriented explicitly — FFmpeg 6.0's autorotate drops flips).
     Thread {
@@ -1069,6 +1106,10 @@ open class BaseVideoTrimModule internal constructor(
       }
 
       fun attempt(audio: Boolean) {
+        if (job.cancelled) {
+          rejectCancelled()
+          return
+        }
         val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
           val cmds = ConformArgs.inputArgs(url, settings, matrix, audio).toMutableList()
           if (copyVideo) {
@@ -1107,20 +1148,24 @@ open class BaseVideoTrimModule internal constructor(
           onStatistics = { /* compress does not surface statistics */ },
           onProgress = { /* compress does not surface progress */ },
           onSuccess = {
-            if (!copyVideo && rotation != 0 && !ConformArgs.patchTrackRotation(File(outputFile), rotation)) {
-              promise.reject(Exception("Compression failed: could not write the rotation matrix"))
+            if (job.cancelled) {
+              rejectCancelled()
+            } else if (!copyVideo && rotation != 0 && !ConformArgs.patchTrackRotation(File(outputFile), rotation)) {
+              reject(Exception("Compression failed: could not write the rotation matrix"))
             } else {
               val result = Arguments.createMap()
               result.putString("outputPath", outputFile)
               result.putString("engine", "ffmpeg")
               result.putString("fallbackReason", "")
               result.putBoolean("audioDropped", !audio && !removeAudio)
-              promise.resolve(result)
+              resolve(result)
             }
           },
-          onCancel = { promise.reject(Exception("Compression was cancelled")) },
+          onCancel = { rejectCancelled() },
           onError = { _, _, session ->
-            if (audio) {
+            if (job.cancelled) {
+              rejectCancelled()
+            } else if (audio) {
               // Most often an audio track no decoder here understands: keep the picture.
               Log.w(TAG, "compress: failed with audio; retrying without it")
               attempt(false)
@@ -1129,17 +1174,20 @@ open class BaseVideoTrimModule internal constructor(
               // so consumers matching on this prefix continue to work.
               val returnCode = session?.returnCode
               val logs = session?.allLogsAsString ?: ""
-              promise.reject(Exception("Compression failed: rc $returnCode\n$logs"))
+              reject(Exception("Compression failed: rc $returnCode\n$logs"))
             }
           },
         )
 
-        VideoTrimmerUtil.executeWithEncoderFallback(
+        val session = VideoTrimmerUtil.executeWithEncoderFallback(
           encoderConfigs = encoderConfigs,
           buildCommand = buildCommand,
           videoDurationMs = 0,
           callbacks = callbacks,
         )
+        job.session = session
+        // A cancel that landed while the attempt was being set up.
+        if (job.cancelled) session.cancel()
       }
       attempt(!removeAudio)
     }.start()
