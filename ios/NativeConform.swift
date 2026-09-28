@@ -299,6 +299,50 @@ public final class NativeConform {
     }
     writer.startSession(atSourceTime: .zero)
 
+    // Never hang. Once the job is cancelled or the pipeline has failed — e.g. iOS tore the
+    // hardware encoder down when the app went to the background — the writer inputs may never ask
+    // for data again, and the pumps below would wait forever. If they haven't wound down a second
+    // after that, finish anyway.
+    let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    var finished = false
+    let finish: (Result<URL, ConformError>) -> Void = { [self] result in
+      self.lock.lock()
+      if finished {
+        self.lock.unlock()
+        return
+      }
+      finished = true
+      self.lock.unlock()
+      watchdog.cancel()
+      completion(result)
+    }
+    var troubleSince: Date?
+    watchdog.schedule(deadline: .now() + 0.25, repeating: 0.25)
+    watchdog.setEventHandler { [self] in
+      let trouble = self.isCancelled || self.reader.status == .failed || self.writer.status == .failed
+      guard trouble else {
+        troubleSince = nil
+        return
+      }
+      guard let since = troubleSince else {
+        troubleSince = Date()
+        return
+      }
+      guard Date().timeIntervalSince(since) >= 1 else { return }
+      self.reader.cancelReading()
+      let error: ConformError
+      if self.isCancelled {
+        error = ConformError(stage: "encode", message: "cancelled")
+      } else if self.writer.status == .failed {
+        error = ConformError(stage: "encode", message: Self.describe(self.writer.error))
+      } else {
+        error = ConformError(stage: "decode", message: Self.describe(self.reader.error))
+      }
+      try? FileManager.default.removeItem(at: output)
+      finish(.failure(error))
+    }
+    watchdog.resume()
+
     let group = DispatchGroup()
     let total = CMTimeGetSeconds(duration)
     var appended = [Int](repeating: 0, count: pairs.count)
@@ -348,24 +392,24 @@ public final class NativeConform {
     group.notify(queue: .global(qos: .userInitiated)) { [self] in
       if self.reader.status == .failed {
         self.writer.cancelWriting()
-        completion(.failure(ConformError(stage: "decode", message: Self.describe(self.reader.error))))
+        finish(.failure(ConformError(stage: "decode", message: Self.describe(self.reader.error))))
         return
       }
       if self.writer.status == .failed {
         self.reader.cancelReading()
-        completion(.failure(ConformError(stage: "encode", message: Self.describe(self.writer.error))))
+        finish(.failure(ConformError(stage: "encode", message: Self.describe(self.writer.error))))
         return
       }
       if self.isCancelled {
         self.writer.cancelWriting()
-        completion(.failure(ConformError(stage: "encode", message: "cancelled")))
+        finish(.failure(ConformError(stage: "encode", message: "cancelled")))
         return
       }
       // Some codecs (e.g. MP3 in an MP4) "open" natively but decode to nothing: an empty
       // track here means the audio would silently vanish — fail so FFmpeg handles the file.
       for (i, (_, input)) in self.pairs.enumerated() where appended[i] == 0 {
         self.writer.cancelWriting()
-        completion(.failure(ConformError(stage: "decode", message: "\(input.mediaType.rawValue) track decoded to nothing")))
+        finish(.failure(ConformError(stage: "decode", message: "\(input.mediaType.rawValue) track decoded to nothing")))
         return
       }
       self.writer.finishWriting {
@@ -376,13 +420,13 @@ public final class NativeConform {
           let want = CMTimeGetSeconds(self.duration)
           if want > 0.3 && got < want * 0.9 - 0.05 {
             try? FileManager.default.removeItem(at: output)
-            completion(.failure(ConformError(stage: "verify", message: String(format: "output %.2fs of %.2fs source", got, want))))
+            finish(.failure(ConformError(stage: "verify", message: String(format: "output %.2fs of %.2fs source", got, want))))
             return
           }
           self.progress?(1)
-          completion(.success(output))
+          finish(.success(output))
         } else {
-          completion(.failure(ConformError(stage: "finish", message: Self.describe(self.writer.error))))
+          finish(.failure(ConformError(stage: "finish", message: Self.describe(self.writer.error))))
         }
       }
     }
