@@ -1621,12 +1621,20 @@ extension VideoTrim {
   // The argv itself lives in ConformArgs.swift.
 
   /// One in-flight `compress` call: the engine currently running it, and whether it was cancelled.
-  /// A cancelled job never falls back to another engine or retries.
+  /// A cancelled job never falls back to another engine or retries, and completes right away —
+  /// it never waits on an engine that may be stuck (iOS tears the hardware encoder down in the
+  /// background).
   final class CompressJob {
     private let lock = NSLock()
     private var cancelled = false
     private var native: NativeConform?
     private var session: FFmpegSession?
+    /// Completes the call as cancelled; set by `compress` before any engine starts.
+    private var onCancel: (() -> Void)?
+
+    func setOnCancel(_ f: (() -> Void)?) {
+      lock.lock(); onCancel = f; lock.unlock()
+    }
 
     var isCancelled: Bool {
       lock.lock(); defer { lock.unlock() }
@@ -1644,9 +1652,10 @@ extension VideoTrim {
     }
 
     func cancel() {
-      lock.lock(); cancelled = true; let n = native; let s = session; lock.unlock()
+      lock.lock(); cancelled = true; let n = native; let s = session; let done = onCancel; lock.unlock()
       n?.cancel()
       s?.cancel()
+      done?()
     }
   }
 
@@ -1672,10 +1681,22 @@ extension VideoTrim {
     compressJobsLock.lock()
     compressJobs.append(job)
     compressJobsLock.unlock()
+    // Exactly once: a cancel completes the call immediately, and whatever the engine reports
+    // later is ignored.
+    let completedLock = NSLock()
+    var completed = false
     let completion: ([String: Any]) -> Void = { payload in
+      completedLock.lock()
+      if completed {
+        completedLock.unlock()
+        return
+      }
+      completed = true
+      completedLock.unlock()
       compressJobsLock.lock()
       compressJobs.removeAll { $0 === job }
       compressJobsLock.unlock()
+      job.setOnCancel(nil) // job ↔ completion reference cycle
       done(payload)
     }
 
@@ -1683,6 +1704,7 @@ extension VideoTrim {
     let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(s.outputExt)"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
+    job.setOnCancel { completion(cancelledPayload(outputFile)) }
 
     let canvas = s.letterbox && s.width > 0 && s.height > 0
     // The native engine writes H.264 at a fixed rate onto a canvas (or copies the video):

@@ -1020,13 +1020,18 @@ open class BaseVideoTrimModule internal constructor(
   // Routed through VideoTrimmerUtil.executeWithEncoderFallback so the encoder
   // fallback chain (h264_mediacodec → mpeg4) covers this path too — see README's
   // "Android encoder compatibility" section.
-  /** One in-flight `compress` call (see [cancelCompress]); a cancelled one never retries. */
+  /**
+   * One in-flight `compress` call (see [cancelCompress]). A cancelled one never retries and
+   * completes right away, without waiting on the engine to wind down.
+   */
   private class CompressJob {
     @Volatile var cancelled = false
     @Volatile var session: TrimSession? = null
+    @Volatile var onCancel: (() -> Unit)? = null
     fun cancel() {
       cancelled = true
       session?.cancel()
+      onCancel?.invoke()
     }
   }
 
@@ -1081,18 +1086,26 @@ open class BaseVideoTrimModule internal constructor(
 
     val job = CompressJob()
     compressJobs.add(job)
+    // Exactly once: a cancel settles the call immediately; whatever the engine reports later is
+    // ignored.
+    val settled = java.util.concurrent.atomic.AtomicBoolean(false)
     fun resolve(result: WritableMap) {
+      if (!settled.compareAndSet(false, true)) return
       compressJobs.remove(job)
+      job.onCancel = null
       promise.resolve(result)
     }
     fun reject(e: Exception) {
+      if (!settled.compareAndSet(false, true)) return
       compressJobs.remove(job)
+      job.onCancel = null
       promise.reject(e)
     }
     fun rejectCancelled() {
       File(outputFile).delete()
       reject(Exception("Compression cancelled"))
     }
+    job.onCancel = { rejectCancelled() }
 
     // FFprobe blocks: read the source's display matrix off the JS thread (mirrored sources are
     // oriented explicitly — FFmpeg 6.0's autorotate drops flips).
