@@ -59,6 +59,9 @@ function createCompressOptions(
     audioChannels: -1,
     copyVideo: false,
     letterbox: false,
+    engine: 'ffmpeg',
+    rotation: 0,
+    hdrToSdr: false,
     ...overrides,
   };
 }

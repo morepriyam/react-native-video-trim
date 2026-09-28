@@ -49,6 +49,7 @@ import com.facebook.react.bridge.UiThreadUtil
 import com.facebook.react.bridge.WritableMap
 import com.videotrim.enums.ErrorCode
 import com.videotrim.interfaces.VideoTrimListener
+import com.videotrim.utils.ConformArgs
 import com.videotrim.utils.MediaMetadataUtil
 import com.videotrim.utils.StorageUtil
 import com.videotrim.utils.TrimEditState
@@ -1031,96 +1032,22 @@ open class BaseVideoTrimModule internal constructor(
     val audioChannels = if (options?.hasKey("audioChannels") == true) options.getInt("audioChannels") else -1
     val copyVideo = options?.hasKey("copyVideo") == true && options.getBoolean("copyVideo")
     val letterbox = options?.hasKey("letterbox") == true && options.getBoolean("letterbox")
+    // `engine` is iOS-only (AVFoundation); Android always runs FFmpeg.
+    val rotation = if (options?.hasKey("rotation") == true) ((options.getInt("rotation") % 360) + 360) % 360 else 0
+    val hdrToSdr = options?.hasKey("hdrToSdr") == true && options.getBoolean("hdrToSdr")
 
+    val settings = ConformArgs.Settings(
+      width = width, height = height, frameRate = frameRate, letterbox = letterbox,
+      copyVideo = copyVideo, removeAudio = removeAudio, audioSampleRate = audioSampleRate,
+      audioChannels = audioChannels, rotation = rotation, hdrToSdr = hdrToSdr,
+    )
     val outputFile = StorageUtil.getCacheOutputPath(reactApplicationContext, outputExt)
-
-    val videoFilters = mutableListOf<String>()
-    if (width > 0 && height > 0) {
-      if (letterbox) {
-        // Fit-and-pad onto an exact WxH canvas (post-autorotation), preserving aspect —
-        // for fixed-canvas pipelines (e.g. imports baked onto a portrait reels canvas).
-        val w = width and 1.inv()
-        val h = height and 1.inv()
-        videoFilters.add("scale=$w:$h:force_original_aspect_ratio=decrease")
-        videoFilters.add("pad=$w:$h:(ow-iw)/2:(oh-ih)/2")
-        videoFilters.add("setsar=1")
-      } else {
-        videoFilters.add("scale=$width:$height")
-      }
-    } else if (width > 0) {
-      videoFilters.add("scale=$width:-2")
-    } else if (height > 0) {
-      videoFilters.add("scale=-2:$height")
-    }
-    // Cast to 8-bit 4:2:0 unconditionally on the re-encode path: MediaCodec
-    // encoders reject 10-bit input from HDR sources, and for 8-bit sources
-    // the filter negotiates to a no-op so SDR inputs pay no conversion cost.
-    videoFilters.add("format=yuv420p")
 
     val bitrateStr = if (bitrate > 0) "${bitrate.toLong()}" else when (quality) {
       "low" -> "500K"
       "high" -> "5M"
       else -> "2M"
     }
-
-    // Audio args shared by the copy and re-encode paths: always AAC (matching
-    // the historical behavior of this method) plus optional -ar/-ac conform.
-    val audioArgs = if (removeAudio) listOf("-an") else buildList {
-      addAll(listOf("-c:a", "aac"))
-      if (audioSampleRate > 0) addAll(listOf("-ar", "$audioSampleRate"))
-      if (audioChannels > 0) addAll(listOf("-ac", "$audioChannels"))
-    }
-
-    val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
-      val cmds = mutableListOf("-i", url)
-      if (copyVideo) {
-        // Audio-only conform: video is stream-copied untouched, so no filters,
-        // frame-rate, or encoder args apply.
-        cmds.addAll(listOf("-c:v", "copy"))
-      } else {
-        // Per-attempt filter chain: any user-requested scale plus, on the mpeg4 software
-        // fallback only, a resolution cap so the output is decodable on-device. Android's
-        // software MPEG-4 decoder rejects full-resolution mpeg4 (NO_EXCEEDS_CAPABILITIES).
-        val attemptFilters = videoFilters.toMutableList()
-        config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
-        cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
-        cmds.addAll(config.args)
-        if (frameRate > 0) {
-          cmds.addAll(listOf("-r", "$frameRate"))
-        }
-      }
-      cmds.addAll(audioArgs)
-      cmds.addAll(VideoTrimmerUtil.faststartFlags(outputFile))
-      if (copyVideo) {
-        cmds.addAll(listOf("-y", outputFile))
-      } else {
-        // -fps_mode vfr prevents frame duplication / non-monotonic DTS errors that
-        // occur when the source has an unusually high time-base (e.g. Pixel 7 recordings
-        // with 45k tbr). Without this, h264_mediacodec tries to encode at the tbr rate,
-        // producing hundreds of duplicate frames and then a fatal muxer DTS collision.
-        cmds.addAll(listOf("-fps_mode", "vfr", "-y", outputFile))
-      }
-      cmds.toTypedArray()
-    }
-
-    val callbacks = VideoTrimmerUtil.TrimCallbacks(
-      onLog = { msg -> msg.getString("message")?.let { Log.d(TAG, "compress: $it") } },
-      onStatistics = { /* compress does not surface statistics */ },
-      onProgress = { /* compress does not surface progress */ },
-      onSuccess = {
-        val result = Arguments.createMap()
-        result.putString("outputPath", outputFile)
-        promise.resolve(result)
-      },
-      onCancel = { promise.reject(Exception("Compression was cancelled")) },
-      onError = { _, _, session ->
-        // Preserve the original error message shape: "Compression failed: rc N\n<full logs>"
-        // so consumers matching on this prefix continue to work.
-        val returnCode = session?.returnCode
-        val logs = session?.allLogsAsString ?: ""
-        promise.reject(Exception("Compression failed: rc $returnCode\n$logs"))
-      },
-    )
 
     // copyVideo needs exactly one attempt (no encoder is opened); otherwise
     // pick the fallback chain, led by the requested codec.
@@ -1130,12 +1057,92 @@ open class BaseVideoTrimModule internal constructor(
       else -> VideoTrimmerUtil.reEncodeEncoderConfigs(bitrateStr)
     }
 
-    VideoTrimmerUtil.executeWithEncoderFallback(
-      encoderConfigs = encoderConfigs,
-      buildCommand = buildCommand,
-      videoDurationMs = 0,
-      callbacks = callbacks,
-    )
+    // FFprobe blocks: read the source's display matrix off the JS thread (mirrored sources are
+    // oriented explicitly — FFmpeg 6.0's autorotate drops flips).
+    Thread {
+      val matrix = if (copyVideo) null else try {
+        FFprobeKit.getMediaInformation(url)?.mediaInformation?.streams
+          ?.firstOrNull { it.type == "video" && !ConformArgs.isAttachedPicture(it.allProperties) }
+          ?.let { ConformArgs.displayMatrix(it.allProperties) }
+      } catch (_: Exception) {
+        null
+      }
+
+      fun attempt(audio: Boolean) {
+        val buildCommand: (VideoTrimmerUtil.EncoderConfig) -> Array<String> = { config ->
+          val cmds = ConformArgs.inputArgs(url, settings, matrix, audio).toMutableList()
+          if (copyVideo) {
+            // Audio-only conform: video is stream-copied untouched, so no filters,
+            // frame-rate, or encoder args apply.
+            cmds.addAll(listOf("-c:v", "copy"))
+          } else {
+            // Per-attempt filter chain plus, on the mpeg4 software fallback only, a resolution
+            // cap so the output is decodable on-device. Android's software MPEG-4 decoder
+            // rejects full-resolution mpeg4 (NO_EXCEEDS_CAPABILITIES).
+            val attemptFilters = ConformArgs.videoFilters(settings, matrix)
+            config.maxLongSide?.let { attemptFilters.add(VideoTrimmerUtil.capLongSideFilter(it)) }
+            cmds.addAll(listOf("-vf", attemptFilters.joinToString(",")))
+            cmds.addAll(config.args)
+            if (frameRate > 0) {
+              cmds.addAll(listOf("-r", ConformArgs.formatRate(frameRate)))
+            }
+          }
+          cmds.addAll(ConformArgs.audioArgs(settings, audio))
+          cmds.addAll(listOf("-sn", "-dn"))
+          cmds.addAll(VideoTrimmerUtil.faststartFlags(outputFile))
+          if (copyVideo) {
+            cmds.addAll(listOf("-y", outputFile))
+          } else {
+            // -fps_mode vfr prevents frame duplication / non-monotonic DTS errors that
+            // occur when the source has an unusually high time-base (e.g. Pixel 7 recordings
+            // with 45k tbr). Without this, h264_mediacodec tries to encode at the tbr rate,
+            // producing hundreds of duplicate frames and then a fatal muxer DTS collision.
+            cmds.addAll(listOf("-fps_mode", "vfr", "-y", outputFile))
+          }
+          cmds.toTypedArray()
+        }
+
+        val callbacks = VideoTrimmerUtil.TrimCallbacks(
+          onLog = { msg -> msg.getString("message")?.let { Log.d(TAG, "compress: $it") } },
+          onStatistics = { /* compress does not surface statistics */ },
+          onProgress = { /* compress does not surface progress */ },
+          onSuccess = {
+            if (!copyVideo && rotation != 0 && !ConformArgs.patchTrackRotation(File(outputFile), rotation)) {
+              promise.reject(Exception("Compression failed: could not write the rotation matrix"))
+            } else {
+              val result = Arguments.createMap()
+              result.putString("outputPath", outputFile)
+              result.putString("engine", "ffmpeg")
+              result.putString("fallbackReason", "")
+              result.putBoolean("audioDropped", !audio && !removeAudio)
+              promise.resolve(result)
+            }
+          },
+          onCancel = { promise.reject(Exception("Compression was cancelled")) },
+          onError = { _, _, session ->
+            if (audio) {
+              // Most often an audio track no decoder here understands: keep the picture.
+              Log.w(TAG, "compress: failed with audio; retrying without it")
+              attempt(false)
+            } else {
+              // Preserve the original error message shape: "Compression failed: rc N\n<full logs>"
+              // so consumers matching on this prefix continue to work.
+              val returnCode = session?.returnCode
+              val logs = session?.allLogsAsString ?: ""
+              promise.reject(Exception("Compression failed: rc $returnCode\n$logs"))
+            }
+          },
+        )
+
+        VideoTrimmerUtil.executeWithEncoderFallback(
+          encoderConfigs = encoderConfigs,
+          buildCommand = buildCommand,
+          videoDurationMs = 0,
+          callbacks = callbacks,
+        )
+      }
+      attempt(!removeAudio)
+    }.start()
   }
 
   // Container + per-stream metadata via FFprobe, mirroring the iOS
@@ -1171,6 +1178,8 @@ open class BaseVideoTrimModule internal constructor(
         result.putInt("audioSampleRate", -1)
         result.putInt("audioChannels", -1)
         result.putDouble("duration", -1.0)
+        result.putDouble("videoDuration", -1.0)
+        result.putBoolean("mirrored", false)
         result.putDouble("fileSize", -1.0)
 
         info.duration?.toDoubleOrNull()?.let { result.putDouble("duration", it * 1000) }
@@ -1190,7 +1199,8 @@ open class BaseVideoTrimModule internal constructor(
           return if (v > 0) v else -1.0
         }
 
-        info.streams?.firstOrNull { it.type == "video" }?.let { v ->
+        // Cover art (an attached picture) is exposed as a video stream too — never "the" video.
+        info.streams?.firstOrNull { it.type == "video" && !ConformArgs.isAttachedPicture(it.allProperties) }?.let { v ->
           result.putBoolean("hasVideo", true)
           result.putString("videoCodec", v.codec ?: "")
           result.putInt("width", (v.width ?: -1L).toInt())
@@ -1202,6 +1212,8 @@ open class BaseVideoTrimModule internal constructor(
           val props = v.allProperties
           result.putString("pixelFormat", props?.optString("pix_fmt") ?: "")
           result.putString("colorTransfer", props?.optString("color_transfer") ?: "")
+          result.putBoolean("mirrored", ConformArgs.isMirror(ConformArgs.displayMatrix(props)))
+          props?.optString("duration")?.toDoubleOrNull()?.let { result.putDouble("videoDuration", it * 1000) }
         }
 
         info.streams?.firstOrNull { it.type == "audio" }?.let { a ->

@@ -1606,114 +1606,109 @@ extension VideoTrim {
   }
 
   // MARK: - Headless API: compress
-  // Re-encodes video with h264_videotoolbox (hardware) at the requested quality/bitrate.
-  // Uses CRF-style -global_quality for quality presets, or explicit -b:v for custom bitrate.
+  // Re-encodes (or, with copyVideo, audio-conforms) a clip. Two engines:
+  //   - "auto" (iOS): NativeConform — AVFoundation hardware decode + GPU scale/letterbox/rotate +
+  //     hardware encode, with real HDR→SDR tone mapping — for canvas (letterbox) and audio-only
+  //     conforms to MP4. Anything it can't read or finish falls through to FFmpeg, and the
+  //     reason is returned as `fallbackReason`.
+  //   - "ffmpeg": h264_videotoolbox (or hevc_videotoolbox) behind VideoToolbox hardware decode.
+  // The FFmpeg command maps exactly the streams probeVideo describes (first real video, first
+  // audio — never FFmpeg's auto-pick, which prefers the most-channels audio: an undecodable
+  // iPhone Spatial Audio APAC track), drops frames before scaling, squares anamorphic pixels,
+  // deinterlaces flagged frames, tone-casts HLG/PQ when `hdrToSdr`, orients mirrored sources
+  // explicitly (FFmpeg 6.0's autorotate ignores flips) and stamps `rotation` into the track
+  // matrix after the encode. Undecodable audio is retried without it (`audioDropped`).
+  // The argv itself lives in ConformArgs.swift.
+
   @objc
   public static func compress(_ url: String, options: NSDictionary, completion: @escaping ([String: Any]) -> Void) {
-    let destPath = URL(string: url) ?? URL(fileURLWithPath: url)
-
-    let quality = options["quality"] as? String ?? "medium"
-    let bitrate = options["bitrate"] as? Double ?? -1
-    let width = options["width"] as? Int ?? -1
-    let height = options["height"] as? Int ?? -1
-    let frameRate = options["frameRate"] as? Double ?? -1
-    let outputExt = options["outputExt"] as? String ?? "mp4"
-    let removeAudio = options["removeAudio"] as? Bool ?? false
-    let codec = options["codec"] as? String ?? "h264"
-    let audioSampleRate = options["audioSampleRate"] as? Int ?? -1
-    let audioChannels = options["audioChannels"] as? Int ?? -1
-    let copyVideo = options["copyVideo"] as? Bool ?? false
-    let letterbox = options["letterbox"] as? Bool ?? false
+    let source = URL(string: url) ?? URL(fileURLWithPath: url)
+    let s = ConformArgs.Settings(options)
 
     let timestamp = Int(Date().timeIntervalSince1970 * 1000)
-    let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(outputExt)"
+    let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(s.outputExt)"
     let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     let outputFile = cacheDirectory.appendingPathComponent(outputName)
 
-    var cmds: [String] = ["-i", destPath.path]
-
-    if copyVideo {
-      // Audio-only conform: the video track is stream-copied untouched. All
-      // video options (scale/quality/bitrate/frameRate/codec) are skipped.
-      cmds.append(contentsOf: ["-c:v", "copy"])
+    let canvas = s.letterbox && s.width > 0 && s.height > 0
+    // The native engine writes H.264 at a fixed rate onto a canvas (or copies the video):
+    // anything else — HEVC, "keep the source rate", free scaling — stays on FFmpeg.
+    let nativeEligible = s.engine == "auto" && s.outputExt.lowercased() == "mp4" && !s.removeAudio
+      && (s.copyVideo || (canvas && s.codec != "hevc" && s.frameRate > 0))
+    guard nativeEligible else {
+      compressWithFFmpeg(source: source, s: s, output: outputFile, fallbackReason: "", completion: completion)
+      return
+    }
+    let bitrate: Int
+    if s.bitrate > 0 {
+      bitrate = Int(s.bitrate)
     } else {
-      var videoFilters: [String] = []
-
-      if width > 0 && height > 0 {
-        if letterbox {
-          // Fit-and-pad onto an exact WxH canvas (post-autorotation), preserving aspect —
-          // for fixed-canvas pipelines (e.g. imports baked onto a portrait reels canvas).
-          let w = width & ~1
-          let h = height & ~1
-          videoFilters.append("scale=\(w):\(h):force_original_aspect_ratio=decrease")
-          videoFilters.append("pad=\(w):\(h):(ow-iw)/2:(oh-ih)/2")
-          videoFilters.append("setsar=1")
-        } else {
-          videoFilters.append("scale=\(width):\(height)")
-        }
-      } else if width > 0 {
-        videoFilters.append("scale=\(width):-2")
-      } else if height > 0 {
-        videoFilters.append("scale=-2:\(height)")
-      }
-
-      // Cast to 8-bit 4:2:0 unconditionally: on FFmpeg builds where the
-      // VideoToolbox encoders advertise a 10-bit input format, HDR/10-bit
-      // sources otherwise fail to open the encoder (same normalization the
-      // trim re-encode path applies). For 8-bit sources the filter negotiates
-      // to a no-op, so SDR inputs pay no conversion cost.
-      videoFilters.append("format=yuv420p")
-      cmds.append(contentsOf: ["-vf", videoFilters.joined(separator: ",")])
-
-      if codec == "hevc" {
-        // hvc1 tag so the MP4 plays on Apple players (which reject hev1).
-        cmds.append(contentsOf: ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1"])
-      } else {
-        cmds.append(contentsOf: ["-c:v", "h264_videotoolbox"])
-      }
-
-      if bitrate > 0 {
-        cmds.append(contentsOf: ["-b:v", "\(Int(bitrate))"])
-      } else {
-        let crf: String
-        switch quality {
-        case "low": crf = "28"
-        case "high": crf = "18"
-        default: crf = "23"
-        }
-        cmds.append(contentsOf: ["-global_quality", crf])
-      }
-
-      if frameRate > 0 {
-        cmds.append(contentsOf: ["-r", "\(frameRate)"])
+      switch s.quality {
+      case "low": bitrate = 2_500_000
+      case "high": bitrate = 8_000_000
+      default: bitrate = 5_000_000
       }
     }
-
-    if removeAudio {
-      cmds.append("-an")
-    } else {
-      cmds.append(contentsOf: ["-c:a", "aac"])
-      if audioSampleRate > 0 {
-        cmds.append(contentsOf: ["-ar", "\(audioSampleRate)"])
-      }
-      if audioChannels > 0 {
-        cmds.append(contentsOf: ["-ac", "\(audioChannels)"])
+    let target = NativeConform.Target(
+      canvasWidth: max(s.width, 2), canvasHeight: max(s.height, 2), rotation: s.rotation,
+      frameRate: max(1, Int(s.frameRate.rounded())), bitrate: bitrate,
+      audioSampleRate: s.audioSampleRate, audioChannels: s.audioChannels, copyVideo: s.copyVideo)
+    NativeConform.run(source: source, output: outputFile, target: target) { result in
+      switch result {
+      case .success:
+        completion(["outputPath": outputFile.absoluteString, "engine": "avfoundation",
+                    "fallbackReason": "", "audioDropped": false])
+      case .failure(let e):
+        NSLog("[compress] native engine failed (%@); falling back to FFmpeg", e.errorDescription ?? "")
+        try? FileManager.default.removeItem(at: outputFile)
+        compressWithFFmpeg(source: source, s: s, output: outputFile,
+                           fallbackReason: e.errorDescription ?? "native engine failed", completion: completion)
       }
     }
+  }
 
-    cmds.append(contentsOf: VideoTrim.faststartFlags(for: outputFile.pathExtension))
-    cmds.append(contentsOf: ["-y", outputFile.path])
-    print("compress command:", cmds.joined(separator: " "))
+  private static func compressWithFFmpeg(source: URL, s: ConformArgs.Settings, output: URL, fallbackReason: String,
+                                         completion: @escaping ([String: Any]) -> Void) {
+    // FFprobe blocks; keep it off the JS/main thread like every other FFmpegKit call here.
+    DispatchQueue.global(qos: .userInitiated).async {
+      let matrix = s.copyVideo ? nil : displayMatrix(of: source.path)
 
-    FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
-      let returnCode = session?.getReturnCode()
-      if ReturnCode.isSuccess(returnCode) {
-        completion(["outputPath": outputFile.absoluteString])
-      } else {
-        let logs = session?.getAllLogsAsString() ?? ""
-        completion(["error": "Compression failed: rc \(String(describing: returnCode))\n\(logs)"])
+      func attempt(audio: Bool) {
+        let cmds = ConformArgs.ffmpegArgs(input: source.path, s: s, output: output, matrix: matrix, audio: audio)
+        print("compress command:", cmds.joined(separator: " "))
+        FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
+          if ReturnCode.isSuccess(session?.getReturnCode()) {
+            if !s.copyVideo && s.rotation != 0 && !ConformArgs.patchTrackRotation(output, rotation: s.rotation) {
+              completion(["error": "Compression failed: could not write the rotation matrix"])
+              return
+            }
+            completion(["outputPath": output.absoluteString, "engine": "ffmpeg",
+                        "fallbackReason": fallbackReason, "audioDropped": !audio && !s.removeAudio])
+          } else if audio {
+            // Most often an audio track no decoder here understands: keep the picture.
+            NSLog("[compress] FFmpeg failed with audio; retrying without it")
+            attempt(audio: false)
+          } else {
+            let logs = session?.getAllLogsAsString() ?? ""
+            completion(["error": "Compression failed: rc \(String(describing: session?.getReturnCode()))\n\(logs)"])
+          }
+        }, withLogCallback: nil, withStatisticsCallback: nil)
       }
-    }, withLogCallback: nil, withStatisticsCallback: nil)
+      attempt(audio: !s.removeAudio)
+    }
+  }
+
+  /// The first real video stream's display matrix (FFmpeg order: a b u c d v x y w), if any.
+  static func displayMatrix(of path: String) -> [Double]? {
+    guard let info = FFprobeKit.getMediaInformation(path)?.getMediaInformation() else { return nil }
+    let streams = (info.getStreams() as? [StreamInformation]) ?? []
+    guard let v = streams.first(where: { $0.getType() == "video" && !isAttachedPicture($0) }) else { return nil }
+    return ConformArgs.displayMatrix(fromProperties: v.getAllProperties() ?? [:])
+  }
+
+  static func isAttachedPicture(_ stream: StreamInformation) -> Bool {
+    let disposition = stream.getAllProperties()?["disposition"] as? [AnyHashable: Any]
+    return (disposition?["attached_pic"] as? NSNumber)?.intValue == 1
   }
 
   // Old Arch
@@ -1766,6 +1761,7 @@ extension VideoTrim {
         "width": -1,
         "height": -1,
         "rotation": 0,
+        "mirrored": false,
         "nominalFps": -1.0,
         "averageFps": -1.0,
         "bitrate": -1,
@@ -1776,6 +1772,7 @@ extension VideoTrim {
         "audioSampleRate": -1,
         "audioChannels": -1,
         "duration": -1.0,
+        "videoDuration": -1.0,
         "fileSize": -1,
       ]
 
@@ -1788,7 +1785,8 @@ extension VideoTrim {
 
       let streams = (info.getStreams() as? [StreamInformation]) ?? []
 
-      if let v = streams.first(where: { $0.getType() == "video" }) {
+      // Cover art (an attached picture) is exposed as a video stream too — never "the" video.
+      if let v = streams.first(where: { $0.getType() == "video" && !isAttachedPicture($0) }) {
         result["hasVideo"] = true
         result["videoCodec"] = v.getCodec() ?? ""
         result["width"] = v.getWidth()?.intValue ?? -1
@@ -1802,6 +1800,10 @@ extension VideoTrim {
         let props = v.getAllProperties() ?? [:]
         result["pixelFormat"] = props["pix_fmt"] as? String ?? ""
         result["colorTransfer"] = props["color_transfer"] as? String ?? ""
+        result["mirrored"] = ConformArgs.isMirror(ConformArgs.displayMatrix(fromProperties: props))
+        if let d = props["duration"] as? String, let seconds = Double(d) {
+          result["videoDuration"] = seconds * 1000
+        }
 
         // Rotation: modern Display Matrix side data first (signed degrees,
         // e.g. -90), then the legacy tags.rotate fallback — the same order

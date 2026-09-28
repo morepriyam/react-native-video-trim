@@ -311,6 +311,14 @@ compress(url: string, options?: Partial<CompressOptions>): Promise<CompressResul
 | `audioSampleRate` | `number` | `-1` | Target audio sample rate in Hz (`-1` to keep original) |
 | `audioChannels` | `number` | `-1` | Target audio channel count (`-1` to keep original) |
 | `copyVideo` | `boolean` | `false` | Stream-copy the video track and only process audio (audio-only conform) |
+| `letterbox` | `boolean` | `false` | With `width` and `height`: scale-fit onto an exact WxH **display** canvas and pad with black |
+| `engine` | `string` | `"ffmpeg"` | `"auto"`: on iOS, AVFoundation first (hardware decode/encode, real HDR→SDR tone mapping), FFmpeg for anything it can't read. Applies to `letterbox` canvas conforms with a `frameRate` and to `copyVideo`, MP4 output only. Android always uses FFmpeg |
+| `rotation` | `number` | `0` | Rotation tag for the output (`probeVideo` convention). With `letterbox`, pixels are written in the rotated coded orientation under this tag — how cameras store portrait |
+| `hdrToSdr` | `boolean` | `false` | Tone-cast an HLG/PQ source to SDR BT.709 on the FFmpeg path (the native engine always outputs SDR) |
+
+**Result:** `outputPath`, `engine` (`"avfoundation"` \| `"ffmpeg"`), `fallbackReason` (the native error when `"auto"` fell back, else `""`), `audioDropped` (`true` when no engine could decode the source audio and the output is silent).
+
+The FFmpeg command maps exactly the streams `probeVideo()` describes (first real video stream, first audio stream — never FFmpeg's auto-pick, which prefers the most-channels audio, e.g. an undecodable iPhone Spatial Audio track), drops frames before scaling, squares anamorphic pixels, deinterlaces flagged frames and orients mirrored sources explicitly.
 
 **Example:**
 ```javascript
@@ -328,13 +336,19 @@ const { outputPath } = await compress('/path/to/video.mp4', {
   removeAudio: true,
 });
 
-// Normalize an import for a merge pipeline: cap to 1080p/30fps H.264
-// with 48 kHz stereo AAC audio. 10-bit/HDR sources are converted to
-// 8-bit SDR automatically on this path.
-const { outputPath } = await compress('/path/to/import.mp4', {
-  height: 1080,
+// Normalize an import for a merge pipeline: a 1080×1920 portrait canvas at
+// 30 fps H.264, written the way a camera stores portrait (coded 1920×1080 under a
+// 90° tag) with 48 kHz stereo AAC — so it joins camera clips by stream copy.
+// HDR sources are tone-mapped to SDR (natively, or via `hdrToSdr` on FFmpeg).
+const { outputPath, engine } = await compress('/path/to/import.mov', {
+  engine: 'auto',
+  width: 1080,
+  height: 1920,
+  letterbox: true,
+  rotation: 90,
   frameRate: 30,
   bitrate: 5_000_000,
+  hdrToSdr: true,
   audioSampleRate: 48_000,
   audioChannels: 2,
 });
@@ -347,7 +361,7 @@ const { outputPath } = await compress('/path/to/video.mp4', {
 
 ### probeVideo()
 
-Probe a local media file's container and stream metadata via FFprobe. Use this to decide whether an imported file needs normalization (via `compress()`) before entering a merge pipeline.
+Probe a local media file's container and stream metadata via FFprobe (cover art is never reported as the video stream). Use this to decide whether an imported file needs normalization (via `compress()`) before entering a merge pipeline.
 
 ```typescript
 probeVideo(url: string): Promise<VideoProbeResult>
@@ -361,6 +375,7 @@ probeVideo(url: string): Promise<VideoProbeResult>
 | `videoCodec` | `string` | Video codec name (e.g. `"h264"`, `"hevc"`) |
 | `width` / `height` | `number` | Coded (pre-rotation) dimensions in pixels |
 | `rotation` | `number` | Display rotation: `0`, `90`, `180`, or `270` |
+| `mirrored` | `boolean` | The display matrix also mirrors the frame (e.g. some front-camera exports) |
 | `nominalFps` | `number` | Container-declared frame rate |
 | `averageFps` | `number` | Average frame rate (differs from nominal on VFR sources) |
 | `bitrate` | `number` | Video bitrate in bps |
@@ -371,6 +386,7 @@ probeVideo(url: string): Promise<VideoProbeResult>
 | `audioSampleRate` | `number` | Audio sample rate in Hz |
 | `audioChannels` | `number` | Audio channel count |
 | `duration` | `number` | Container duration in milliseconds |
+| `videoDuration` | `number` | Video stream duration in milliseconds (the container's can be longer) |
 | `fileSize` | `number` | File size in bytes |
 
 **Example:**

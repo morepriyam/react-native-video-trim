@@ -281,6 +281,9 @@ RCT_EXPORT_MODULE()
   dict[@"audioChannels"] = @(options.audioChannels());
   dict[@"copyVideo"] = @(options.copyVideo());
   dict[@"letterbox"] = @(options.letterbox());
+  dict[@"engine"] = options.engine();
+  dict[@"rotation"] = @(options.rotation());
+  dict[@"hdrToSdr"] = @(options.hdrToSdr());
 
   [VideoTrimSwift compress:url options:dict completion:^(NSDictionary<NSString *, id> * _Nonnull result) {
     if (result[@"error"]) {
