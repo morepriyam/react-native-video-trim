@@ -81,6 +81,11 @@ class VideoTrimModule internal constructor(context: ReactApplicationContext) : V
   }
 
   @ReactMethod
+  override fun cancelCompress() {
+    base.cancelCompress()
+  }
+
+  @ReactMethod
   override fun compress(url: String, options: ReadableMap?, promise: Promise) {
     base.compress(url, options, promise)
   }

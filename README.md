@@ -359,6 +359,22 @@ const { outputPath } = await compress('/path/to/video.mp4', {
 });
 ```
 
+### cancelCompress()
+
+Cancel every in-flight `compress()` call; merges, trims and other jobs are untouched. Each cancelled call rejects promptly with `"Compression cancelled"`. No fallback engine or retry runs, and its partial output is deleted.
+
+```typescript
+cancelCompress(): void
+```
+
+```javascript
+import { cancelCompress, compress } from 'react-native-video-trim';
+
+const pending = compress(uri, { engine: 'auto' /* … */ });
+// e.g. the app went to the background:
+cancelCompress(); // `pending` rejects with "Compression cancelled"
+```
+
 ### probeVideo()
 
 Probe a local media file's container and stream metadata via FFprobe (cover art is never reported as the video stream). Use this to decide whether an imported file needs normalization (via `compress()`) before entering a merge pipeline.

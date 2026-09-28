@@ -81,20 +81,23 @@ public final class NativeConform {
   // MARK: Public entry
 
   /// Conform `source` into `output` (overwritten). Completion fires once on a background queue.
+  /// Returns the running job (for `cancel()`), or nil when setup already failed.
+  @discardableResult
   public static func run(source: URL, output: URL, target: Target,
                          progress: ((Double) -> Void)? = nil,
-                         completion: @escaping (Result<URL, ConformError>) -> Void) {
+                         completion: @escaping (Result<URL, ConformError>) -> Void) -> NativeConform? {
     let job: NativeConform
     do {
       job = try prepare(source: source, output: output, target: target, progress: progress)
     } catch let e as ConformError {
       completion(.failure(e))
-      return
+      return nil
     } catch {
       completion(.failure(ConformError(stage: "prepare", message: error.localizedDescription)))
-      return
+      return nil
     }
     job.start(output: output, completion: completion)
+    return job
   }
 
   // MARK: Setup
@@ -458,7 +461,9 @@ public final class NativeConform {
     return cancelled
   }
 
-  private func cancel() {
+  /// Stop the job: the reader is cancelled, nothing more is written, and the completion fails
+  /// with "cancelled".
+  public func cancel() {
     lock.lock(); cancelled = true; lock.unlock()
     reader.cancelReading()
   }

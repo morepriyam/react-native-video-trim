@@ -294,6 +294,10 @@ RCT_EXPORT_MODULE()
   }];
 }
 
+- (void)cancelCompress {
+  [VideoTrimSwift cancelCompress];
+}
+
 - (void)probeVideo:(nonnull NSString *)url
            resolve:(nonnull RCTPromiseResolveBlock)resolve
             reject:(nonnull RCTPromiseRejectBlock)reject {
@@ -487,6 +491,7 @@ RCT_EXTERN_METHOD(extractAudio:(NSString*)url withOptions:(NSDictionary *)option
 RCT_EXTERN_METHOD(compress:(NSString*)url withOptions:(NSDictionary *)options
                   withResolver:(RCTPromiseResolveBlock)resolve
                   withRejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(cancelCompress)
 RCT_EXTERN_METHOD(probeVideo:(NSString*)url withResolver:(RCTPromiseResolveBlock)resolve
                   withRejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(toGif:(NSString*)url withOptions:(NSDictionary *)options

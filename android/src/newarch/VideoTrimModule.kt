@@ -81,6 +81,10 @@ class VideoTrimModule(
     base.extractAudio(url, options, promise)
   }
 
+  override fun cancelCompress() {
+    base.cancelCompress()
+  }
+
   override fun compress(url: String, options: ReadableMap, promise: Promise) {
     base.compress(url, options, promise)
   }

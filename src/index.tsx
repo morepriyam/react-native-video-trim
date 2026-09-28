@@ -361,6 +361,14 @@ export function compress(
 }
 
 /**
+ * Cancel every in-flight {@link compress}. Each rejects promptly with "Compression cancelled"
+ * (no fallback or retry runs; partial output is deleted). Merges and trims are untouched.
+ */
+export function cancelCompress(): void {
+  VideoTrim.cancelCompress();
+}
+
+/**
  * Probe a local media file's container and stream metadata (codec, coded
  * dimensions, rotation, frame rates, bitrate, pixel format, color transfer,
  * audio parameters) via FFprobe. Use this to decide whether an imported file

@@ -1620,10 +1620,64 @@ extension VideoTrim {
   // matrix after the encode. Undecodable audio is retried without it (`audioDropped`).
   // The argv itself lives in ConformArgs.swift.
 
+  /// One in-flight `compress` call: the engine currently running it, and whether it was cancelled.
+  /// A cancelled job never falls back to another engine or retries.
+  final class CompressJob {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var native: NativeConform?
+    private var session: FFmpegSession?
+
+    var isCancelled: Bool {
+      lock.lock(); defer { lock.unlock() }
+      return cancelled
+    }
+
+    func attach(native n: NativeConform?) {
+      lock.lock(); native = n; let c = cancelled; lock.unlock()
+      if c { n?.cancel() }
+    }
+
+    func attach(session s: FFmpegSession?) {
+      lock.lock(); session = s; let c = cancelled; lock.unlock()
+      if c { s?.cancel() }
+    }
+
+    func cancel() {
+      lock.lock(); cancelled = true; let n = native; let s = session; lock.unlock()
+      n?.cancel()
+      s?.cancel()
+    }
+  }
+
+  private static let compressJobsLock = NSLock()
+  private static var compressJobs: [CompressJob] = []
+
+  /// Cancel every in-flight `compress` (merges, trims and other jobs are untouched). Each one
+  /// rejects promptly with "Compression cancelled", its partial output deleted.
   @objc
-  public static func compress(_ url: String, options: NSDictionary, completion: @escaping ([String: Any]) -> Void) {
+  public static func cancelCompress() {
+    compressJobsLock.lock()
+    let jobs = compressJobs
+    compressJobsLock.unlock()
+    jobs.forEach { $0.cancel() }
+  }
+
+  @objc
+  public static func compress(_ url: String, options: NSDictionary, completion done: @escaping ([String: Any]) -> Void) {
     let source = URL(string: url) ?? URL(fileURLWithPath: url)
     let s = ConformArgs.Settings(options)
+
+    let job = CompressJob()
+    compressJobsLock.lock()
+    compressJobs.append(job)
+    compressJobsLock.unlock()
+    let completion: ([String: Any]) -> Void = { payload in
+      compressJobsLock.lock()
+      compressJobs.removeAll { $0 === job }
+      compressJobsLock.unlock()
+      done(payload)
+    }
 
     let timestamp = Int(Date().timeIntervalSince1970 * 1000)
     let outputName = "\(FILE_PREFIX)_compressed_\(timestamp).\(s.outputExt)"
@@ -1636,7 +1690,7 @@ extension VideoTrim {
     let nativeEligible = s.engine == "auto" && s.outputExt.lowercased() == "mp4" && !s.removeAudio
       && (s.copyVideo || (canvas && s.codec != "hevc" && s.frameRate > 0))
     guard nativeEligible else {
-      compressWithFFmpeg(source: source, s: s, output: outputFile, fallbackReason: "", completion: completion)
+      compressWithFFmpeg(source: source, s: s, output: outputFile, fallbackReason: "", job: job, completion: completion)
       return
     }
     let bitrate: Int
@@ -1653,7 +1707,11 @@ extension VideoTrim {
       canvasWidth: max(s.width, 2), canvasHeight: max(s.height, 2), rotation: s.rotation,
       frameRate: max(1, Int(s.frameRate.rounded())), bitrate: bitrate,
       audioSampleRate: s.audioSampleRate, audioChannels: s.audioChannels, copyVideo: s.copyVideo)
-    NativeConform.run(source: source, output: outputFile, target: target) { result in
+    let native = NativeConform.run(source: source, output: outputFile, target: target) { result in
+      if job.isCancelled {
+        completion(cancelledPayload(outputFile))
+        return
+      }
       switch result {
       case .success:
         completion(["outputPath": outputFile.absoluteString, "engine": "avfoundation",
@@ -1662,22 +1720,35 @@ extension VideoTrim {
         NSLog("[compress] native engine failed (%@); falling back to FFmpeg", e.errorDescription ?? "")
         try? FileManager.default.removeItem(at: outputFile)
         compressWithFFmpeg(source: source, s: s, output: outputFile,
-                           fallbackReason: e.errorDescription ?? "native engine failed", completion: completion)
+                           fallbackReason: e.errorDescription ?? "native engine failed", job: job,
+                           completion: completion)
       }
     }
+    job.attach(native: native)
+  }
+
+  private static func cancelledPayload(_ output: URL) -> [String: Any] {
+    try? FileManager.default.removeItem(at: output)
+    return ["error": "Compression cancelled"]
   }
 
   private static func compressWithFFmpeg(source: URL, s: ConformArgs.Settings, output: URL, fallbackReason: String,
-                                         completion: @escaping ([String: Any]) -> Void) {
+                                         job: CompressJob, completion: @escaping ([String: Any]) -> Void) {
     // FFprobe blocks; keep it off the JS/main thread like every other FFmpegKit call here.
     DispatchQueue.global(qos: .userInitiated).async {
       let matrix = s.copyVideo ? nil : displayMatrix(of: source.path)
 
       func attempt(audio: Bool) {
+        if job.isCancelled {
+          completion(cancelledPayload(output))
+          return
+        }
         let cmds = ConformArgs.ffmpegArgs(input: source.path, s: s, output: output, matrix: matrix, audio: audio)
         print("compress command:", cmds.joined(separator: " "))
-        FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
-          if ReturnCode.isSuccess(session?.getReturnCode()) {
+        let session = FFmpegKit.execute(withArgumentsAsync: cmds, withCompleteCallback: { session in
+          if job.isCancelled || ReturnCode.isCancel(session?.getReturnCode()) {
+            completion(cancelledPayload(output))
+          } else if ReturnCode.isSuccess(session?.getReturnCode()) {
             if !s.copyVideo && s.rotation != 0 && !ConformArgs.patchTrackRotation(output, rotation: s.rotation) {
               completion(["error": "Compression failed: could not write the rotation matrix"])
               return
@@ -1693,6 +1764,7 @@ extension VideoTrim {
             completion(["error": "Compression failed: rc \(String(describing: session?.getReturnCode()))\n\(logs)"])
           }
         }, withLogCallback: nil, withStatisticsCallback: nil)
+        job.attach(session: session)
       }
       attempt(audio: !s.removeAudio)
     }
@@ -1709,6 +1781,12 @@ extension VideoTrim {
   static func isAttachedPicture(_ stream: StreamInformation) -> Bool {
     let disposition = stream.getAllProperties()?["disposition"] as? [AnyHashable: Any]
     return (disposition?["attached_pic"] as? NSNumber)?.intValue == 1
+  }
+
+  // Old Arch
+  @objc(cancelCompress)
+  func cancelCompressOldArch() {
+    VideoTrim.cancelCompress()
   }
 
   // Old Arch
